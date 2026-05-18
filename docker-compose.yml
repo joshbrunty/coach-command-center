@@ -1,0 +1,99 @@
+name: coach-command-center
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-coach}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-coach_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-coach_command_center}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    profiles: ["prod"]
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-coach}:${POSTGRES_PASSWORD:-coach_dev_password}@db:5432/${POSTGRES_DB:-coach_command_center}
+      APP_NAMESPACE: ${APP_NAMESPACE:-coach-command-center}
+      PORT: 3000
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  web:
+    profiles: ["prod"]
+    build:
+      context: .
+      target: web
+    restart: unless-stopped
+    environment:
+      APP_SITE_ADDRESS: ${APP_SITE_ADDRESS:-:80}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api-dev:
+    profiles: ["dev"]
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev:api"
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-coach}:${POSTGRES_PASSWORD:-coach_dev_password}@db:5432/${POSTGRES_DB:-coach_command_center}
+      APP_NAMESPACE: ${APP_NAMESPACE:-coach-command-center}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      PORT: 3000
+    volumes:
+      - .:/app
+      - api_node_modules:/app/node_modules
+    ports:
+      - "${API_DEV_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web-dev:
+    profiles: ["dev"]
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev:web -- --host 0.0.0.0"
+    restart: unless-stopped
+    environment:
+      CHOKIDAR_USEPOLLING: ${CHOKIDAR_USEPOLLING:-true}
+      VITE_API_PROXY_TARGET: http://api-dev:3000
+    volumes:
+      - .:/app
+      - web_node_modules:/app/node_modules
+    ports:
+      - "${WEB_DEV_PORT:-5173}:5173"
+    depends_on:
+      - api-dev
+
+volumes:
+  postgres_data:
+  api_node_modules:
+  web_node_modules:
