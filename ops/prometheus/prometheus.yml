@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 10s
+  scrape_timeout: 5s
+  external_labels:
+    namespace: coach-command-center
+    event: icc-2026
+
+scrape_configs:
+  - job_name: scoreboard
+    static_configs:
+      - targets:
+          - scoreboard-exporter:9101
+        labels:
+          source: scoreboard-exporter
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

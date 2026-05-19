@@ -1,0 +1,20 @@
+{
+  "name": "scoreboard-exporter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Prometheus exporter for the ICC 2026 attack/defense scoreboard. Supports HTTP polling and SQLite tailing.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.1",
+    "prom-client": "^15.1.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
