@@ -47,7 +47,6 @@ const SORT_OPTIONS = [
 
 const COMP_DAYS = {
   jeopardy: { label: 'JEOPARDY', color: '#d4a843', icon: '◆' },
-  ad:       { label: 'A & D',    color: '#06b6d4', icon: '⚔' },
 };
 
 const DEFAULT_HR_HOURS = 7;
@@ -599,7 +598,7 @@ export default function CoachCommandCenter() {
           <StatCard label="ENGAGED" value={stats.inProg} icon={<Activity size={14} />} accent="#f59e0b" />
           <StatCard label="STUCK" value={stats.stuck} icon={<AlertCircle size={14} />} accent="#dc2626" />
           <StatCard label="OPS ENGAGED" value={`${stats.engagedOps}/${stats.totalOps}`} icon={<UserCheck size={14} />} accent="#d4a843" />
-          {settings.competitionDay === 'jeopardy' && settings.startTime ? (
+          {settings.startTime ? (
             <StatCard label="LOCKED IN HR" value={`${stats.solvedHR} · ${stats.pointsHR}pt`} icon={<Lock size={14} />} accent="#10b981" />
           ) : (
             <StatCard label="POINTS" value={stats.points} icon={<Award size={14} />} accent="#d4a843" />
@@ -756,7 +755,6 @@ export default function CoachCommandCenter() {
 
 function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) {
   const day = COMP_DAYS[settings.competitionDay] || COMP_DAYS.jeopardy;
-  const isJeopardy = settings.competitionDay === 'jeopardy';
 
   if (phase.phase === 'pending') {
     return (
@@ -845,8 +843,8 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
   const phaseLabel = isHR ? 'HUMAN RESISTANCE' : 'ROBOT UPRISING';
   const phaseDesc = isHR ? 'Simple AI only · Score-lock zone' : 'Approved AI enabled · Score decaying';
 
-  const showLockUrgent = isJeopardy && isHR && phase.phaseRemaining <= LOCK_URGENT_MS;
-  const showLockWarn = isJeopardy && isHR && phase.phaseRemaining <= LOCK_WARN_MS && !showLockUrgent;
+  const showLockUrgent = isHR && phase.phaseRemaining <= LOCK_URGENT_MS;
+  const showLockWarn = isHR && phase.phaseRemaining <= LOCK_WARN_MS && !showLockUrgent;
 
   const hrPct = (phase.hrMs / phase.totalMs) * 100;
   const elapsedPct = Math.min(100, (phase.elapsed / phase.totalMs) * 100);
@@ -1013,7 +1011,6 @@ function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
   const stat = STATUSES[challenge.status];
   const isSolved = challenge.status === 'solved';
   const solvedIn = solvedPhase(challenge, settings);
-  const isJeopardy = settings.competitionDay === 'jeopardy';
   const isStale = (challenge.status === 'in-progress' || challenge.status === 'stuck') &&
                   (Date.now() - challenge.updatedAt) > STALE_THRESHOLD_MS;
 
@@ -1052,13 +1049,13 @@ function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
             </span>
           )}
           {solvedIn === 'human-resistance' && (
-            <span title={isJeopardy ? 'Score locked at end-of-HR value' : 'Solved during Human Resistance phase'} style={{
+            <span title="Score locked at end-of-HR value" style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
               fontSize: 9, padding: '2px 6px', background: 'rgba(16,185,129,0.12)',
               border: '1px solid rgba(16,185,129,0.4)', color: '#10b981',
               borderRadius: 2, letterSpacing: '0.1em', fontWeight: 600,
             }}>
-              <Lock size={9} /> {isJeopardy ? 'LOCKED' : 'HR'}
+              <Lock size={9} /> LOCKED
             </span>
           )}
           {solvedIn === 'robot-uprising' && (
@@ -1540,7 +1537,6 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
 
   const cat = CATEGORIES[draft.category] || CATEGORIES.misc;
   const sp = solvedPhase(draft, settings);
-  const isJeopardy = settings.competitionDay === 'jeopardy';
 
   return (
     <Modal onClose={onClose} width={760}>
@@ -1554,7 +1550,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           <Badge color={cat.color}>{cat.label}</Badge>
           <DifficultyDots level={draft.difficulty} />
           {sp === 'human-resistance' && (
-            <Badge color="#10b981"><Lock size={10} /> {isJeopardy ? 'SCORE LOCKED · HR' : 'SOLVED IN HR'}</Badge>
+            <Badge color="#10b981"><Lock size={10} /> SCORE LOCKED · HR</Badge>
           )}
           {sp === 'robot-uprising' && (
             <Badge color="#ef4444"><Cpu size={10} /> SOLVED IN RU</Badge>
@@ -1577,7 +1573,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           placeholder="Challenge name…"
           style={{ fontSize: 20, fontWeight: 600, padding: '10px 14px', marginBottom: 18 }} />
 
-        {isJeopardy && draft.status !== 'solved' && phase.phase === 'human-resistance' && phase.phaseRemaining < LOCK_WARN_MS && (
+        {draft.status !== 'solved' && phase.phase === 'human-resistance' && phase.phaseRemaining < LOCK_WARN_MS && (
           <div style={{
             marginBottom: 18, padding: 12,
             background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)',
@@ -2070,24 +2066,17 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
               <GhostBtn onClick={() => onSaveSettings({ ...settings, eventName: eventName.trim() || 'COACH COMMAND CENTER' })}>Save</GhostBtn>
             </div>
 
-            <SectionLabel icon={<Target size={11} />}>COMPETITION DAY</SectionLabel>
-            <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
-              {Object.entries(COMP_DAYS).map(([k, d]) => {
-                const on = settings.competitionDay === k;
-                return (
-                  <button key={k} onClick={() => onSaveSettings({ ...settings, competitionDay: k })} style={{
-                    flex: 1, background: on ? `${d.color}15` : 'rgba(255,255,255,0.02)',
-                    border: `1px solid ${on ? d.color : 'rgba(255,255,255,0.1)'}`,
-                    color: on ? d.color : 'rgba(255,255,255,0.6)',
-                    padding: '12px', borderRadius: 4, cursor: 'pointer',
-                    fontFamily: '"Chakra Petch", sans-serif', fontSize: 13, fontWeight: 600,
-                    letterSpacing: '0.1em', textTransform: 'uppercase',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-                  }}>
-                    <span style={{ fontSize: 18 }}>{d.icon}</span> {d.label}
-                  </button>
-                );
-              })}
+            <SectionLabel icon={<Target size={11} />}>COMPETITION TYPE</SectionLabel>
+            <div style={{ marginBottom: 18 }}>
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+                padding: '10px 16px', background: 'rgba(212,168,67,0.1)',
+                border: '1px solid rgba(212,168,67,0.4)', borderRadius: 4,
+                color: '#d4a843', fontFamily: '"Chakra Petch", sans-serif',
+                fontSize: 13, fontWeight: 600, letterSpacing: '0.1em',
+              }}>
+                <span style={{ fontSize: 16 }}>◆</span> JEOPARDY
+              </span>
             </div>
 
             <SectionLabel icon={<Clock size={11} />}>START TIME</SectionLabel>
