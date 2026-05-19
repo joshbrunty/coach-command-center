@@ -57,9 +57,14 @@ Do not run destructive data commands such as `docker compose down -v` unless the
 
 ## Validation
 
-There is currently no dedicated test suite. For most code changes, run the narrowest meaningful validation:
+There is currently no dedicated test suite. For most code changes, run the narrowest meaningful validation.
+The repo requires Node 22+; if your host has an older version, run via the `web-dev` container:
 
 ```bash
+# Preferred: runs inside the Node 22 container
+docker compose --profile dev exec web-dev npm run build
+
+# Or directly if your host Node is 22+
 npm run build
 ```
 
@@ -119,7 +124,11 @@ The `event-settings` shape (after the commit-3 migration):
 }
 ```
 
-When changing persisted shapes, add migration logic near the existing `migrate` or `migrateRoster` helpers. Do not assume old event data can be thrown away unless the user has explicitly said the branch is disposable.
+When changing persisted shapes, add migration logic near the existing `migrate`, `migrateRoster`, or `migrateSettings` helpers. Do not assume old event data can be thrown away unless the user has explicitly said the branch is disposable.
+
+The `migrateSettings` function runs on every load. It is idempotent — running it twice produces the same result. Current migrations:
+- `competitionDay: 'ad'` → `'jeopardy'`
+- `hrHours`/`ruHours` present → convert to `durationHours`, `useLockedPhase=true`, `lockedPhaseHours`, `lockedPhaseLabel='Human Resistance'`, `openPhaseLabel='Robot Uprising'`
 
 Flags and notes are currently visible to everyone with access to the app on the tailnet. Do not add roles, private notes, or permissions without asking first.
 

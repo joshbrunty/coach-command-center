@@ -77,9 +77,22 @@ competition is split into two named phases (locked and open), and challenges
 solved during the locked phase have their score frozen at the end-of-locked-phase
 value.
 
+Key settings fields:
+
+| Field | Default | Meaning |
+| ----- | ------- | ------- |
+| `durationHours` | `9` | Total event length |
+| `useLockedPhase` | `false` | Off = single flat timer |
+| `lockedPhaseHours` | `7` | Only used when `useLockedPhase=true` |
+| `lockedPhaseLabel` | `'Phase 1'` | Display name for locked phase |
+| `openPhaseLabel` | `'Phase 2'` | Display name for open phase |
+
 An **ICC 2026 preset** button in settings applies the USCT competition
 configuration: 7h Human Resistance (locked, simple AI only) + 2h Robot Uprising
 (open, approved AI permitted).
+
+Old events stored with `hrHours`/`ruHours` automatically migrate to the locked-phase
+model on first load, preserving their Human Resistance / Robot Uprising labels.
 
 ---
 
@@ -285,8 +298,8 @@ Read `AGENTS.md` before making changes. The short version:
 - Favor small diffs in `coach-command-center.jsx`. Do not split it up as
   cleanup during unrelated feature work.
 - Persisted shapes (`challenge:*`, `team-roster`, `event-settings`) require
-  migrations in the existing `migrate` / `migrateRoster` helpers, not a new
-  schema.
+  migrations in the existing `migrateSettings` / `migrateRoster` helpers.
+  `migrateSettings` runs on every load and is idempotent.
 - Do not run `docker compose down -v` during a live event.
 - Do not change `vite.config.js` `server.allowedHosts` without restarting
   `web-dev`.
