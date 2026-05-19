@@ -51,6 +51,7 @@ const COMP_DAYS = {
 
 const DEFAULT_HR_HOURS = 7;
 const DEFAULT_RU_HOURS = 2;
+const DEFAULT_DURATION_HOURS = 9;
 const MAX_SUBS_PER_DAY = 2;
 const STALE_THRESHOLD_MS = 30 * 60 * 1000;
 const LOCK_WARN_MS = 60 * 60 * 1000;
@@ -83,26 +84,40 @@ const fmtRelative = (ts) => {
 function getPhase(settings, now = Date.now()) {
   const start = settings.startTime;
   if (!start) return { phase: 'pending', elapsed: 0, totalMs: 0 };
-  const hrMs = (settings.hrHours ?? DEFAULT_HR_HOURS) * 3600_000;
-  const ruMs = (settings.ruHours ?? DEFAULT_RU_HOURS) * 3600_000;
-  const totalMs = hrMs + ruMs;
-  const hrEndsAt = start + hrMs;
-  const ruEndsAt = start + totalMs;
-  const elapsed = now - start;
-  if (elapsed < 0) return { phase: 'scheduled', startsIn: -elapsed, elapsed: 0, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt };
-  if (elapsed >= totalMs) return { phase: 'ended', elapsed: totalMs, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt };
-  if (elapsed < hrMs) {
-    return { phase: 'human-resistance', elapsed, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt,
-      phaseElapsed: elapsed, phaseTotal: hrMs, phaseRemaining: hrMs - elapsed };
+
+  const useLockedPhase = settings.useLockedPhase ?? false;
+
+  if (!useLockedPhase) {
+    const totalMs = (settings.durationHours ?? DEFAULT_DURATION_HOURS) * 3600_000;
+    const elapsed = now - start;
+    if (elapsed < 0) return { phase: 'scheduled', startsIn: -elapsed, elapsed: 0, totalMs };
+    if (elapsed >= totalMs) return { phase: 'ended', elapsed: totalMs, totalMs };
+    return { phase: 'in-progress', elapsed, totalMs,
+      phaseElapsed: elapsed, phaseTotal: totalMs, phaseRemaining: totalMs - elapsed };
   }
-  return { phase: 'robot-uprising', elapsed, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt,
-    phaseElapsed: elapsed - hrMs, phaseTotal: ruMs, phaseRemaining: totalMs - elapsed };
+
+  // Locked-phase mode
+  const lockedMs = (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS) * 3600_000;
+  const totalMs = (settings.durationHours ?? DEFAULT_DURATION_HOURS) * 3600_000;
+  const openMs = totalMs - lockedMs;
+  const lockedEndsAt = start + lockedMs;
+  const elapsed = now - start;
+  if (elapsed < 0) return { phase: 'scheduled', startsIn: -elapsed, elapsed: 0, totalMs, lockedMs, openMs, lockedEndsAt };
+  if (elapsed >= totalMs) return { phase: 'ended', elapsed: totalMs, totalMs, lockedMs, openMs, lockedEndsAt };
+  if (elapsed < lockedMs) {
+    return { phase: 'locked', elapsed, totalMs, lockedMs, openMs, lockedEndsAt,
+      phaseElapsed: elapsed, phaseTotal: lockedMs, phaseRemaining: lockedMs - elapsed };
+  }
+  return { phase: 'open', elapsed, totalMs, lockedMs, openMs, lockedEndsAt,
+    phaseElapsed: elapsed - lockedMs, phaseTotal: openMs, phaseRemaining: totalMs - elapsed };
 }
 
 function solvedPhase(challenge, settings) {
   if (challenge.status !== 'solved' || !challenge.solvedAt || !settings.startTime) return null;
-  const hrEndsAt = settings.startTime + (settings.hrHours ?? DEFAULT_HR_HOURS) * 3600_000;
-  return challenge.solvedAt <= hrEndsAt ? 'human-resistance' : 'robot-uprising';
+  if (!(settings.useLockedPhase ?? false)) return null;
+  const lockedMs = (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS) * 3600_000;
+  const lockedEndsAt = settings.startTime + lockedMs;
+  return challenge.solvedAt <= lockedEndsAt ? 'locked' : 'open';
 }
 
 const newChallenge = (overrides = {}) => ({
@@ -135,9 +150,32 @@ const SETTINGS_KEY = 'event-settings';
 
 const DEFAULT_SETTINGS = {
   eventName: 'COACH COMMAND CENTER', competitionDay: 'jeopardy',
-  startTime: null, hrHours: DEFAULT_HR_HOURS, ruHours: DEFAULT_RU_HOURS,
+  startTime: null,
+  durationHours: DEFAULT_DURATION_HOURS,
+  useLockedPhase: false,
+  lockedPhaseHours: DEFAULT_HR_HOURS,
+  lockedPhaseLabel: 'Phase 1',
+  openPhaseLabel: 'Phase 2',
   subsUsed: 0,
 };
+
+function migrateSettings(raw) {
+  const s = { ...DEFAULT_SETTINGS, ...raw };
+  // Coerce old A&D competition day
+  if (s.competitionDay === 'ad') s.competitionDay = 'jeopardy';
+  // Migrate hrHours/ruHours -> locked-phase model
+  if ((s.hrHours != null || s.ruHours != null) && s.durationHours === DEFAULT_DURATION_HOURS && !s.useLockedPhase) {
+    const hr = s.hrHours ?? DEFAULT_HR_HOURS;
+    const ru = s.ruHours ?? DEFAULT_RU_HOURS;
+    s.durationHours = hr + ru;
+    s.useLockedPhase = true;
+    s.lockedPhaseHours = hr;
+    s.lockedPhaseLabel = 'Human Resistance';
+    s.openPhaseLabel = 'Robot Uprising';
+  }
+  // hrHours / ruHours kept for one release cycle for safety
+  return s;
+}
 
 const storage = {
   async listChallenges() {
@@ -170,7 +208,7 @@ const storage = {
   async getSettings() {
     try {
       const r = await window.storage.get(SETTINGS_KEY, SHARED);
-      return r ? { ...DEFAULT_SETTINGS, ...JSON.parse(r.value) } : DEFAULT_SETTINGS;
+      return r ? migrateSettings(JSON.parse(r.value)) : DEFAULT_SETTINGS;
     } catch { return DEFAULT_SETTINGS; }
   },
   async saveSettings(s) {
@@ -467,8 +505,8 @@ export default function CoachCommandCenter() {
       key: k, total: challenges.filter(c => c.category === k).length,
       solved: challenges.filter(c => c.category === k && c.status === 'solved').length,
     }));
-    const solvedHR = challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').length;
-    const pointsHR = challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').reduce((s, c) => s + (c.points || 0), 0);
+    const solvedHR = challenges.filter(c => solvedPhase(c, settings) === 'locked').length;
+    const pointsHR = challenges.filter(c => solvedPhase(c, settings) === 'locked').reduce((s, c) => s + (c.points || 0), 0);
     return { total, solved, inProg, stuck, points, totalOps, engagedOps: engagedOps.size, byCat, solvedHR, pointsHR };
   }, [challenges, activeRoster, settings, tick]);
 
@@ -770,7 +808,7 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
               ◆ COMPETITION TIMER NOT SET
             </div>
             <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.65)', marginTop: 2 }}>
-              Set the start time and day type to begin tracking competition phase (Human Resistance / Robot Uprising).
+              Set the start time in settings to begin tracking competition phase.
             </div>
           </div>
         </div>
@@ -837,16 +875,37 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
     );
   }
 
-  const isHR = phase.phase === 'human-resistance';
-  const phaseColor = isHR ? '#d4a843' : '#ef4444';
-  const phaseIcon = isHR ? <ShieldAlert size={20} /> : <Cpu size={20} />;
-  const phaseLabel = isHR ? 'HUMAN RESISTANCE' : 'ROBOT UPRISING';
-  const phaseDesc = isHR ? 'Simple AI only · Score-lock zone' : 'Approved AI enabled · Score decaying';
+  // Active phase: 'in-progress', 'locked', or 'open'
+  const useLockedPhase = settings.useLockedPhase ?? false;
+  const isLocked = phase.phase === 'locked';
+  const isInProgress = phase.phase === 'in-progress';
 
-  const showLockUrgent = isHR && phase.phaseRemaining <= LOCK_URGENT_MS;
-  const showLockWarn = isHR && phase.phaseRemaining <= LOCK_WARN_MS && !showLockUrgent;
+  let phaseColor, phaseIcon, phaseLabel, phaseDesc, showLockUrgent, showLockWarn;
 
-  const hrPct = (phase.hrMs / phase.totalMs) * 100;
+  if (!useLockedPhase || isInProgress) {
+    phaseColor = '#d4a843';
+    phaseIcon = <Activity size={20} />;
+    phaseLabel = 'IN PROGRESS';
+    phaseDesc = `${fmtCountdown(phase.phaseRemaining)} remaining`;
+    showLockUrgent = false;
+    showLockWarn = false;
+  } else if (isLocked) {
+    phaseColor = '#d4a843';
+    phaseIcon = <ShieldAlert size={20} />;
+    phaseLabel = (settings.lockedPhaseLabel || 'Phase 1').toUpperCase();
+    phaseDesc = 'Score-lock zone · lock triggers at phase end';
+    showLockUrgent = phase.phaseRemaining <= LOCK_URGENT_MS;
+    showLockWarn = phase.phaseRemaining <= LOCK_WARN_MS && !showLockUrgent;
+  } else {
+    phaseColor = '#ef4444';
+    phaseIcon = <Cpu size={20} />;
+    phaseLabel = (settings.openPhaseLabel || 'Phase 2').toUpperCase();
+    phaseDesc = 'Open phase · scores decaying';
+    showLockUrgent = false;
+    showLockWarn = false;
+  }
+
+  const lockedPct = useLockedPhase && !isInProgress ? (phase.lockedMs / phase.totalMs) * 100 : 100;
   const elapsedPct = Math.min(100, (phase.elapsed / phase.totalMs) * 100);
 
   return (
@@ -890,7 +949,7 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
         <div style={{ display: 'flex', gap: 20, alignItems: 'center' }}>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: 9, letterSpacing: '0.2em', color: 'rgba(255,255,255,0.5)' }}>
-              {isHR ? 'SCORE LOCK IN' : 'COMPETITION ENDS'}
+              {isLocked ? 'SCORE LOCK IN' : 'COMPETITION ENDS'}
             </div>
             <div style={{
               fontFamily: '"JetBrains Mono", monospace', fontSize: 24, fontWeight: 700,
@@ -907,18 +966,24 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
       </div>
 
       <div style={{ position: 'relative', height: 10, background: 'rgba(0,0,0,0.4)', borderRadius: 2, overflow: 'hidden', marginBottom: 4 }}>
-        <div style={{
-          position: 'absolute', left: 0, top: 0, bottom: 0, width: `${hrPct}%`,
-          background: 'rgba(212, 168, 67, 0.15)',
-          borderRight: '1px solid rgba(255,255,255,0.3)',
-        }} />
-        <div style={{
-          position: 'absolute', left: `${hrPct}%`, top: 0, bottom: 0, right: 0,
-          background: 'rgba(239, 68, 68, 0.15)',
-        }} />
+        {useLockedPhase && !isInProgress && (
+          <>
+            <div style={{
+              position: 'absolute', left: 0, top: 0, bottom: 0, width: `${lockedPct}%`,
+              background: 'rgba(212, 168, 67, 0.15)',
+              borderRight: '1px solid rgba(255,255,255,0.3)',
+            }} />
+            <div style={{
+              position: 'absolute', left: `${lockedPct}%`, top: 0, bottom: 0, right: 0,
+              background: 'rgba(239, 68, 68, 0.15)',
+            }} />
+          </>
+        )}
         <div style={{
           position: 'absolute', left: 0, top: 0, bottom: 0, width: `${elapsedPct}%`,
-          background: `linear-gradient(90deg, #d4a843 0%, #d4a843 ${hrPct/Math.max(elapsedPct,0.01)*100}%, #ef4444 100%)`,
+          background: useLockedPhase && !isInProgress
+            ? `linear-gradient(90deg, #d4a843 0%, #d4a843 ${lockedPct/Math.max(elapsedPct,0.01)*100}%, #ef4444 100%)`
+            : '#d4a843',
           opacity: 0.85,
         }} />
         <div style={{
@@ -926,14 +991,16 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
           background: '#fff', boxShadow: '0 0 8px #fff',
         }} />
       </div>
-      <div style={{
-        display: 'flex', justifyContent: 'space-between', fontSize: 9, letterSpacing: '0.15em',
-        color: 'rgba(255,255,255,0.4)', fontFamily: '"JetBrains Mono", monospace',
-      }}>
-        <span>HR · {settings.hrHours ?? DEFAULT_HR_HOURS}H</span>
-        <span style={{ color: phaseColor }}>▲ NOW</span>
-        <span>RU · {settings.ruHours ?? DEFAULT_RU_HOURS}H</span>
-      </div>
+      {useLockedPhase && !isInProgress && (
+        <div style={{
+          display: 'flex', justifyContent: 'space-between', fontSize: 9, letterSpacing: '0.15em',
+          color: 'rgba(255,255,255,0.4)', fontFamily: '"JetBrains Mono", monospace',
+        }}>
+          <span>{(settings.lockedPhaseLabel || 'Phase 1').toUpperCase()} · {settings.lockedPhaseHours ?? DEFAULT_HR_HOURS}H</span>
+          <span style={{ color: phaseColor }}>▲ NOW</span>
+          <span>{(settings.openPhaseLabel || 'Phase 2').toUpperCase()} · {Math.max(0, (settings.durationHours ?? DEFAULT_DURATION_HOURS) - (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS))}H</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -1048,8 +1115,8 @@ function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
               {challenge.points} PT
             </span>
           )}
-          {solvedIn === 'human-resistance' && (
-            <span title="Score locked at end-of-HR value" style={{
+          {solvedIn === 'locked' && (
+            <span title="Score locked at end of locked phase" style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
               fontSize: 9, padding: '2px 6px', background: 'rgba(16,185,129,0.12)',
               border: '1px solid rgba(16,185,129,0.4)', color: '#10b981',
@@ -1058,13 +1125,13 @@ function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
               <Lock size={9} /> LOCKED
             </span>
           )}
-          {solvedIn === 'robot-uprising' && (
-            <span title="Solved during Robot Uprising phase" style={{
+          {solvedIn === 'open' && (
+            <span title="Solved during open phase" style={{
               fontSize: 9, padding: '2px 6px', background: 'rgba(239,68,68,0.12)',
               border: '1px solid rgba(239,68,68,0.4)', color: '#ef4444',
               borderRadius: 2, letterSpacing: '0.1em', fontWeight: 600,
             }}>
-              <Cpu size={9} style={{ verticalAlign: -1, marginRight: 2 }} />RU
+              <Cpu size={9} style={{ verticalAlign: -1, marginRight: 2 }} />OPEN
             </span>
           )}
         </div>
@@ -1413,7 +1480,7 @@ function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChalle
                           </span>
                         </span>
                         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          {sp === 'human-resistance' && (
+                          {sp === 'locked' && (
                             <span style={{ fontSize: 9, color: '#10b981', letterSpacing: '0.1em' }}>
                               <Lock size={9} style={{ verticalAlign: -1 }} /> LOCKED
                             </span>
@@ -1549,11 +1616,11 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <Badge color={cat.color}>{cat.label}</Badge>
           <DifficultyDots level={draft.difficulty} />
-          {sp === 'human-resistance' && (
-            <Badge color="#10b981"><Lock size={10} /> SCORE LOCKED · HR</Badge>
+          {sp === 'locked' && (
+            <Badge color="#10b981"><Lock size={10} /> SCORE LOCKED · {(settings.lockedPhaseLabel || 'Phase 1').toUpperCase()}</Badge>
           )}
-          {sp === 'robot-uprising' && (
-            <Badge color="#ef4444"><Cpu size={10} /> SOLVED IN RU</Badge>
+          {sp === 'open' && (
+            <Badge color="#ef4444"><Cpu size={10} /> SOLVED IN {(settings.openPhaseLabel || 'Phase 2').toUpperCase()}</Badge>
           )}
           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontFamily: '"JetBrains Mono", monospace' }}>
             #{draft.id.slice(-6)}
@@ -1573,7 +1640,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           placeholder="Challenge name…"
           style={{ fontSize: 20, fontWeight: 600, padding: '10px 14px', marginBottom: 18 }} />
 
-        {draft.status !== 'solved' && phase.phase === 'human-resistance' && phase.phaseRemaining < LOCK_WARN_MS && (
+        {draft.status !== 'solved' && (settings.useLockedPhase ?? false) && phase.phase === 'locked' && phase.phaseRemaining < LOCK_WARN_MS && (
           <div style={{
             marginBottom: 18, padding: 12,
             background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)',
@@ -1581,7 +1648,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           }}>
             <AlertTriangle size={18} color="#ef4444" />
             <div style={{ flex: 1, fontSize: 12, color: '#fca5a5' }}>
-              <b>LOCK-IN PRIORITY:</b> Robot Uprising starts in <b style={{ fontFamily: '"JetBrains Mono", monospace' }}>{fmtCountdown(phase.phaseRemaining)}</b>. Score will continue decaying if not solved before then.
+              <b>LOCK-IN PRIORITY:</b> {settings.openPhaseLabel || 'Phase 2'} starts in <b style={{ fontFamily: '"JetBrains Mono", monospace' }}>{fmtCountdown(phase.phaseRemaining)}</b>. Score will continue decaying if not solved before then.
             </div>
           </div>
         )}
@@ -1845,9 +1912,9 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
     engaged: challenges.filter(c => c.status === 'in-progress').length,
     stuck: challenges.filter(c => c.status === 'stuck').length,
     points: challenges.filter(c => c.status === 'solved').reduce((s, c) => s + (c.points || 0), 0),
-    solvedHR: challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').length,
-    solvedRU: challenges.filter(c => solvedPhase(c, settings) === 'robot-uprising').length,
-    pointsHR: challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').reduce((s, c) => s + (c.points || 0), 0),
+    solvedHR: challenges.filter(c => solvedPhase(c, settings) === 'locked').length,
+    solvedRU: challenges.filter(c => solvedPhase(c, settings) === 'open').length,
+    pointsHR: challenges.filter(c => solvedPhase(c, settings) === 'locked').reduce((s, c) => s + (c.points || 0), 0),
   };
 
   const byCat = Object.entries(CATEGORIES).map(([k, v]) => ({
@@ -1863,11 +1930,14 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
     return { name: p.name, status: p.status, assigned: assigned.length, engaged, solved };
   });
 
+  const lockedLabel = settings.lockedPhaseLabel || 'Phase 1';
+  const openLabel = settings.openPhaseLabel || 'Phase 2';
   const phaseDesc = phase.phase === 'pending' ? 'Not started'
     : phase.phase === 'scheduled' ? `Scheduled to start ${new Date(settings.startTime).toLocaleString()}`
     : phase.phase === 'ended' ? 'Concluded'
-    : phase.phase === 'human-resistance' ? `Human Resistance · ${fmtCountdown(phase.phaseRemaining)} until score lock`
-    : `Robot Uprising · ${fmtCountdown(phase.phaseRemaining)} remaining`;
+    : phase.phase === 'locked' ? `${lockedLabel} · ${fmtCountdown(phase.phaseRemaining)} until score lock`
+    : phase.phase === 'open' ? `${openLabel} · ${fmtCountdown(phase.phaseRemaining)} remaining`
+    : `In Progress · ${fmtCountdown(phase.phaseRemaining)} remaining`;
 
   const sortedChallenges = [...challenges].sort((a, b) => {
     const order = { 'in-progress': 0, stuck: 1, unsolved: 2, solved: 3 };
@@ -1877,7 +1947,7 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
   const challengeRows = sortedChallenges.map(c => {
     const cat = CATEGORIES[c.category] || CATEGORIES.misc;
     const sp = solvedPhase(c, settings);
-    const phaseTag = sp === 'human-resistance' ? '🔒 HR' : sp === 'robot-uprising' ? 'RU' : '';
+    const phaseTag = sp === 'locked' ? `🔒 ${lockedLabel}` : sp === 'open' ? openLabel : '';
     return `
       <tr class="status-${c.status}">
         <td><span class="cat" style="background:${cat.color}22;color:${cat.color};border-color:${cat.color}">${escapeHTML(cat.label)}</span></td>
@@ -2094,27 +2164,70 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
               </GhostBtn>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 18 }}>
-              <div>
-                <SectionLabel icon={<ShieldAlert size={11} />}>HUMAN RESISTANCE HOURS</SectionLabel>
-                <Input type="number" min="0" max="24" step="0.5"
-                  value={settings.hrHours ?? DEFAULT_HR_HOURS}
-                  onChange={e => onSaveSettings({ ...settings, hrHours: parseFloat(e.target.value) || 0 })} />
-              </div>
-              <div>
-                <SectionLabel icon={<Cpu size={11} />}>ROBOT UPRISING HOURS</SectionLabel>
-                <Input type="number" min="0" max="24" step="0.5"
-                  value={settings.ruHours ?? DEFAULT_RU_HOURS}
-                  onChange={e => onSaveSettings({ ...settings, ruHours: parseFloat(e.target.value) || 0 })} />
-              </div>
+            <SectionLabel icon={<Clock size={11} />}>TOTAL DURATION (HOURS)</SectionLabel>
+            <div style={{ marginBottom: 18 }}>
+              <Input type="number" min="0" max="48" step="0.5"
+                value={settings.durationHours ?? DEFAULT_DURATION_HOURS}
+                onChange={e => onSaveSettings({ ...settings, durationHours: parseFloat(e.target.value) || 0 })} />
             </div>
+
+            <SectionLabel icon={<Lock size={11} />}>LOCKED PHASE</SectionLabel>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: 'rgba(255,255,255,0.8)' }}>
+                <input type="checkbox"
+                  checked={settings.useLockedPhase ?? false}
+                  onChange={e => onSaveSettings({ ...settings, useLockedPhase: e.target.checked })}
+                  style={{ width: 14, height: 14, cursor: 'pointer', accentColor: '#d4a843' }} />
+                Enable locked phase (score freeze at phase boundary)
+              </label>
+            </div>
+
+            {(settings.useLockedPhase ?? false) && (
+              <div style={{ marginBottom: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 12 }}>
+                  <div>
+                    <SectionLabel icon={<ShieldAlert size={11} />}>LOCKED PHASE HOURS</SectionLabel>
+                    <Input type="number" min="0" max="48" step="0.5"
+                      value={settings.lockedPhaseHours ?? DEFAULT_HR_HOURS}
+                      onChange={e => onSaveSettings({ ...settings, lockedPhaseHours: parseFloat(e.target.value) || 0 })} />
+                  </div>
+                  <div />
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 12 }}>
+                  <div>
+                    <SectionLabel icon={<ShieldAlert size={11} />}>LOCKED PHASE LABEL</SectionLabel>
+                    <Input value={settings.lockedPhaseLabel || ''}
+                      placeholder="e.g. Human Resistance"
+                      onChange={e => onSaveSettings({ ...settings, lockedPhaseLabel: e.target.value })} />
+                  </div>
+                  <div>
+                    <SectionLabel icon={<Cpu size={11} />}>OPEN PHASE LABEL</SectionLabel>
+                    <Input value={settings.openPhaseLabel || ''}
+                      placeholder="e.g. Robot Uprising"
+                      onChange={e => onSaveSettings({ ...settings, openPhaseLabel: e.target.value })} />
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div style={{
               padding: 12, background: 'rgba(212,168,67,0.05)', border: '1px solid rgba(212,168,67,0.2)',
-              borderRadius: 3, fontSize: 12, color: 'rgba(255,255,255,0.7)', lineHeight: 1.5,
+              borderRadius: 3, fontSize: 12, color: 'rgba(255,255,255,0.7)', lineHeight: 1.5, marginBottom: 10,
             }}>
               <b style={{ color: '#d4a843' }}>ICC 2026 default:</b> 9-hour competition = 7h Human Resistance (simple AI only) + 2h Robot Uprising (approved AI permitted).
               On Jeopardy day, challenges solved during HR have their score locked at end-of-HR value.
+            </div>
+            <div style={{ marginBottom: 18 }}>
+              <GhostBtn onClick={() => onSaveSettings({
+                ...settings,
+                durationHours: 9,
+                useLockedPhase: true,
+                lockedPhaseHours: 7,
+                lockedPhaseLabel: 'Human Resistance',
+                openPhaseLabel: 'Robot Uprising',
+              })}>
+                <Zap size={12} /> ICC 2026 Preset
+              </GhostBtn>
             </div>
 
             <div style={{
