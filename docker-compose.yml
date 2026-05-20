@@ -25,6 +25,10 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-coach}:${POSTGRES_PASSWORD:-coach_dev_password}@db:5432/${POSTGRES_DB:-coach_command_center}
       APP_NAMESPACE: ${APP_NAMESPACE:-coach-command-center}
+      METACTF_API_BASE_URL: ${METACTF_API_BASE_URL:-}
+      METACTF_API_TOKEN: ${METACTF_API_TOKEN:-}
+      ICC_API_BASE_URL: ${ICC_API_BASE_URL:-https://api.icc2026.metactf.io}
+      ICC_COACH_TOKEN: ${ICC_COACH_TOKEN:-}
       PORT: 3000
     depends_on:
       db:
@@ -66,6 +70,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-coach}:${POSTGRES_PASSWORD:-coach_dev_password}@db:5432/${POSTGRES_DB:-coach_command_center}
       APP_NAMESPACE: ${APP_NAMESPACE:-coach-command-center}
       CORS_ORIGIN: ${CORS_ORIGIN:-}
+      METACTF_API_BASE_URL: ${METACTF_API_BASE_URL:-}
+      METACTF_API_TOKEN: ${METACTF_API_TOKEN:-}
+      ICC_API_BASE_URL: ${ICC_API_BASE_URL:-https://api.icc2026.metactf.io}
+      ICC_COACH_TOKEN: ${ICC_COACH_TOKEN:-}
       PORT: 3000
     volumes:
       - .:/app

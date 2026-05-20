@@ -1,4 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { fetchIccStatus, fetchIccBundle } from './src/icc-api-client.js';
+import {
+  buildSnapshotFromIccBundle,
+  buildIccAlerts,
+  computeIccRecommendation,
+  ICC_RECOMMENDATIONS,
+  iccRecommendationScoreBoost,
+} from './src/icc-sync.js';
 import {
   Plus, X, Search, Clock, Check, Users, Flag, Star, Trash2, Tag,
   ExternalLink, AlertCircle, Award, Activity, Terminal, RefreshCw,
@@ -36,6 +44,55 @@ const STATUSES = {
   solved:        { label: 'SOLVED',    color: '#10b981' },
 };
 
+const RESOURCE_NEEDS = {
+  none:       { label: 'NO EXTRA RESOURCE', color: '#64748b' },
+  operator:   { label: 'ADD OPERATOR',      color: '#f59e0b' },
+  specialist: { label: 'CATEGORY SPECIALIST', color: '#d4a843' },
+  rest:       { label: 'REST / ROTATE',     color: '#06b6d4' },
+  tooling:    { label: 'TOOLING / INFRA',   color: '#a855f7' },
+  drop:       { label: 'DROP CANDIDATE',    color: '#ef4444' },
+};
+
+const COACH_DECISIONS = {
+  watch:          { label: 'WATCH',               color: '#94a3b8' },
+  continue:       { label: 'KEEP WORKING',        color: '#10b981' },
+  add_resource:   { label: 'ADD RESOURCE',        color: '#f59e0b' },
+  swap_resource:  { label: 'SWAP RESOURCE',       color: '#06b6d4' },
+  phase_priority: { label: 'PHASE PRIORITY',      color: '#d4a843' },
+  park:           { label: 'PARK',                color: '#a855f7' },
+  drop:           { label: 'DROP',                color: '#ef4444' },
+};
+
+const EXPERIENCE_LEVELS = {
+  novice:   { label: 'NOVICE',   color: '#94a3b8' },
+  solid:    { label: 'SOLID',    color: '#06b6d4' },
+  strong:   { label: 'STRONG',   color: '#10b981' },
+  expert:   { label: 'EXPERT',   color: '#d4a843' },
+};
+
+const AVAILABILITY_STATUSES = {
+  available: { label: 'AVAILABLE', color: '#10b981' },
+  loaded:    { label: 'LOADED',    color: '#f59e0b' },
+  fatigued:  { label: 'FATIGUED',  color: '#ef4444' },
+  resting:   { label: 'RESTING',   color: '#06b6d4' },
+};
+
+const CAPTAIN_CONFIDENCE = {
+  unknown:     { label: 'UNKNOWN',     color: '#64748b', weight: 0 },
+  low:         { label: 'LOW',         color: '#ef4444', weight: 20 },
+  medium:      { label: 'MEDIUM',      color: '#f59e0b', weight: 45 },
+  high:        { label: 'HIGH',        color: '#10b981', weight: 70 },
+  'near-solved': { label: 'NEAR-SOLVED', color: '#d4a843', weight: 90 },
+};
+
+const PHASE_SOLVE_CONFIDENCE = {
+  unknown:           { label: 'UNKNOWN',           color: '#64748b', weight: 0 },
+  unlikely:          { label: 'UNLIKELY',          color: '#ef4444', weight: 15 },
+  possible:          { label: 'POSSIBLE',          color: '#f59e0b', weight: 45 },
+  likely:            { label: 'LIKELY',            color: '#10b981', weight: 70 },
+  'yes-if-resourced': { label: 'YES IF RESOURCED', color: '#d4a843', weight: 65 },
+};
+
 const SORT_OPTIONS = [
   { value: 'updated',    label: 'Recent update' },
   { value: 'created',    label: 'Date added' },
@@ -47,11 +104,11 @@ const SORT_OPTIONS = [
 
 const COMP_DAYS = {
   jeopardy: { label: 'JEOPARDY', color: '#d4a843', icon: '◆' },
-  ad:       { label: 'A & D',    color: '#06b6d4', icon: '⚔' },
 };
 
 const DEFAULT_HR_HOURS = 7;
 const DEFAULT_RU_HOURS = 2;
+const DEFAULT_DURATION_HOURS = 9;
 const MAX_SUBS_PER_DAY = 2;
 const STALE_THRESHOLD_MS = 30 * 60 * 1000;
 const LOCK_WARN_MS = 60 * 60 * 1000;
@@ -84,61 +141,255 @@ const fmtRelative = (ts) => {
 function getPhase(settings, now = Date.now()) {
   const start = settings.startTime;
   if (!start) return { phase: 'pending', elapsed: 0, totalMs: 0 };
-  const hrMs = (settings.hrHours ?? DEFAULT_HR_HOURS) * 3600_000;
-  const ruMs = (settings.ruHours ?? DEFAULT_RU_HOURS) * 3600_000;
-  const totalMs = hrMs + ruMs;
-  const hrEndsAt = start + hrMs;
-  const ruEndsAt = start + totalMs;
-  const elapsed = now - start;
-  if (elapsed < 0) return { phase: 'scheduled', startsIn: -elapsed, elapsed: 0, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt };
-  if (elapsed >= totalMs) return { phase: 'ended', elapsed: totalMs, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt };
-  if (elapsed < hrMs) {
-    return { phase: 'human-resistance', elapsed, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt,
-      phaseElapsed: elapsed, phaseTotal: hrMs, phaseRemaining: hrMs - elapsed };
+
+  const useLockedPhase = settings.useLockedPhase ?? false;
+
+  if (!useLockedPhase) {
+    const totalMs = (settings.durationHours ?? DEFAULT_DURATION_HOURS) * 3600_000;
+    const elapsed = now - start;
+    if (elapsed < 0) return { phase: 'scheduled', startsIn: -elapsed, elapsed: 0, totalMs };
+    if (elapsed >= totalMs) return { phase: 'ended', elapsed: totalMs, totalMs };
+    return { phase: 'in-progress', elapsed, totalMs,
+      phaseElapsed: elapsed, phaseTotal: totalMs, phaseRemaining: totalMs - elapsed };
   }
-  return { phase: 'robot-uprising', elapsed, totalMs, hrMs, ruMs, hrEndsAt, ruEndsAt,
-    phaseElapsed: elapsed - hrMs, phaseTotal: ruMs, phaseRemaining: totalMs - elapsed };
+
+  // Locked-phase mode
+  const lockedMs = (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS) * 3600_000;
+  const totalMs = (settings.durationHours ?? DEFAULT_DURATION_HOURS) * 3600_000;
+  const openMs = totalMs - lockedMs;
+  const lockedEndsAt = start + lockedMs;
+  const elapsed = now - start;
+  if (elapsed < 0) return { phase: 'scheduled', startsIn: -elapsed, elapsed: 0, totalMs, lockedMs, openMs, lockedEndsAt };
+  if (elapsed >= totalMs) return { phase: 'ended', elapsed: totalMs, totalMs, lockedMs, openMs, lockedEndsAt };
+  if (elapsed < lockedMs) {
+    return { phase: 'locked', elapsed, totalMs, lockedMs, openMs, lockedEndsAt,
+      phaseElapsed: elapsed, phaseTotal: lockedMs, phaseRemaining: lockedMs - elapsed };
+  }
+  return { phase: 'open', elapsed, totalMs, lockedMs, openMs, lockedEndsAt,
+    phaseElapsed: elapsed - lockedMs, phaseTotal: openMs, phaseRemaining: totalMs - elapsed };
 }
 
 function solvedPhase(challenge, settings) {
   if (challenge.status !== 'solved' || !challenge.solvedAt || !settings.startTime) return null;
-  const hrEndsAt = settings.startTime + (settings.hrHours ?? DEFAULT_HR_HOURS) * 3600_000;
-  return challenge.solvedAt <= hrEndsAt ? 'human-resistance' : 'robot-uprising';
+  if (!(settings.useLockedPhase ?? false)) return null;
+  const lockedMs = (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS) * 3600_000;
+  const lockedEndsAt = settings.startTime + lockedMs;
+  return challenge.solvedAt <= lockedEndsAt ? 'locked' : 'open';
 }
 
 const newChallenge = (overrides = {}) => ({
   id: uid(), title: '', category: 'misc', difficulty: 'medium', points: 0,
   status: 'unsolved', assignees: [], flag: '', notes: '', url: '', tags: [],
   createdAt: Date.now(), updatedAt: Date.now(), solvedAt: null, solvedBy: [],
-  starred: false, hintsUsed: 0, ...overrides,
+  starred: false, hintsUsed: 0,
+  platformId: '', platformSource: '', platformPoints: null, platformMaxPoints: null,
+  platformSolveCount: null, platformSolved: false, captainProgress: null, captainTimeSpentMinutes: null,
+  captainConfidence: 'unknown', phaseSolveConfidence: 'unknown',
+  rankImpact: null, resourceAskCategory: '', resourceAskName: '',
+  resourceNeed: 'none', coachDecision: 'watch', lastMeetingAt: null, meetingHistory: [],
+  ...overrides,
 });
 
 const migrate = (ch) => ({
   ...ch, points: ch.points || 0, tags: ch.tags || [],
   assignees: ch.assignees || [], solvedBy: ch.solvedBy || [],
   hintsUsed: ch.hintsUsed || 0,
+  platformId: ch.platformId || '',
+  platformSource: ch.platformSource || '',
+  platformPoints: ch.platformPoints ?? null,
+  platformMaxPoints: ch.platformMaxPoints ?? null,
+  platformSolveCount: ch.platformSolveCount ?? null,
+  platformSolved: ch.platformSolved ?? false,
+  captainProgress: ch.captainProgress ?? null,
+  captainTimeSpentMinutes: ch.captainTimeSpentMinutes ?? null,
+  captainConfidence: ch.captainConfidence || 'unknown',
+  phaseSolveConfidence: ch.phaseSolveConfidence || 'unknown',
+  rankImpact: ch.rankImpact ?? null,
+  resourceAskCategory: ch.resourceAskCategory || '',
+  resourceAskName: ch.resourceAskName || '',
+  resourceNeed: ch.resourceNeed || 'none',
+  coachDecision: ch.coachDecision || 'watch',
+  lastMeetingAt: ch.lastMeetingAt ?? null,
+  meetingHistory: ch.meetingHistory || [],
 });
 
 const migrateRoster = (roster) => {
   if (!Array.isArray(roster)) return [];
   return roster.map(p => typeof p === 'string'
-    ? { name: p, status: 'active', subbedOutAt: null }
-    : { status: 'active', subbedOutAt: null, ...p });
+    ? { name: p, status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '' }
+    : { status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '', ...p });
 };
+
+function parseCSVRows(text) {
+  const rows = [];
+  let row = [];
+  let value = '';
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (quoted && ch === '"' && next === '"') { value += '"'; i += 1; continue; }
+    if (ch === '"') { quoted = !quoted; continue; }
+    if (!quoted && ch === ',') { row.push(value.trim()); value = ''; continue; }
+    if (!quoted && (ch === '\n' || ch === '\r')) {
+      if (ch === '\r' && next === '\n') i += 1;
+      row.push(value.trim()); value = '';
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+      continue;
+    }
+    value += ch;
+  }
+  row.push(value.trim());
+  if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+const readFirst = (obj, keys) => keys.map(k => obj?.[k]).find(v => v != null && v !== '');
+
+function normalizePlatformChallenge(raw, source = 'manual') {
+  const title = String(readFirst(raw, ['title', 'name', 'challenge', 'Challenge', 'Name', 'Title']) || '').trim();
+  const id = String(readFirst(raw, ['id', 'challengeId', 'challenge_id', 'slug', 'ID']) || title).trim();
+  if (!title && !id) return null;
+  const categoryRaw = String(readFirst(raw, ['category', 'Category', 'cat']) || 'misc').toLowerCase().trim();
+  const category = Object.keys(CATEGORIES).find(k => categoryRaw.includes(k)) || 'misc';
+  const points = Number(readFirst(raw, ['points', 'value', 'score', 'Points', 'Value']) || 0) || 0;
+  const solves = Number(readFirst(raw, ['solves', 'solveCount', 'solve_count', 'solved_by_count', 'Solves']) || 0) || 0;
+  const rankImpact = Number(readFirst(raw, ['rankImpact', 'rank_impact', 'impact', 'Rank Impact']) || 0) || null;
+  const solvedRaw = readFirst(raw, ['ourSolved', 'solved', 'teamSolved', 'Solved', 'status']);
+  const solvedText = String(solvedRaw ?? '').toLowerCase();
+  const ourSolved = solvedRaw === true || solvedText === 'true' || solvedText === 'yes' || solvedText === 'solved';
+  return {
+    platformId: id || title,
+    platformSource: source || 'manual',
+    title: title || id,
+    category,
+    currentPoints: points,
+    solveCount: solves,
+    rankImpact,
+    ourSolved,
+    raw,
+  };
+}
+
+function normalizePlatformScoreboard(raw = {}) {
+  const scoreboard = raw.scoreboard || raw.standings || raw.rank || raw.meta || raw;
+  const ourRank = Number(readFirst(scoreboard, ['ourRank', 'rank', 'place', 'position', 'Rank']) || 0) || null;
+  const ourScore = Number(readFirst(scoreboard, ['ourScore', 'score', 'points', 'Score']) || 0) || null;
+  const gapAbove = Number(readFirst(scoreboard, ['gapAbove', 'pointsToNext', 'points_to_next', 'gap_up', 'Gap Above']) || 0) || null;
+  const gapBelow = Number(readFirst(scoreboard, ['gapBelow', 'leadOverNext', 'gap_down', 'Gap Below']) || 0) || null;
+  const teams = Array.isArray(scoreboard.teams) ? scoreboard.teams : Array.isArray(raw.teams) ? raw.teams : [];
+  return { ourRank, ourScore, gapAbove, gapBelow, teams };
+}
+
+function parsePlatformImport(text, source = 'metactf') {
+  const trimmed = text.trim();
+  if (!trimmed) return { challenges: [], scoreboard: null, errors: ['Paste JSON or CSV platform data first.'] };
+  try {
+    const parsed = JSON.parse(trimmed);
+    const list = Array.isArray(parsed) ? parsed : parsed.challenges || parsed.data || parsed.items || [];
+    if (!Array.isArray(list)) return { challenges: [], scoreboard: null, errors: ['JSON must be an array or contain a challenges/data/items array.'] };
+    return {
+      challenges: list.map(item => normalizePlatformChallenge(item, source)).filter(Boolean),
+      scoreboard: Array.isArray(parsed) ? null : normalizePlatformScoreboard(parsed),
+      errors: [],
+    };
+  } catch {
+    const rows = parseCSVRows(trimmed);
+    if (rows.length < 2) return { challenges: [], scoreboard: null, errors: ['CSV import needs a header row and at least one data row.'] };
+    const headers = rows[0].map(h => h.trim());
+    const challenges = rows.slice(1).map(row => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = row[i]; });
+      return normalizePlatformChallenge(obj, source);
+    }).filter(Boolean);
+    return { challenges, scoreboard: null, errors: [] };
+  }
+}
+
+function buildPlatformSnapshot({ source, challenges, scoreboard = null }) {
+  const importedAt = Date.now();
+  return {
+    id: `platform-snapshot:${importedAt}`,
+    source: source || 'manual',
+    importedAt,
+    challengeCount: challenges.length,
+    adapter: {
+      source: source || 'manual',
+      mode: source === 'metactf' ? 'swagger-ready' : 'manual-import',
+      normalizedAt: importedAt,
+      apiRoute: source === 'metactf' ? '/api/platform/metactf/snapshot' : null,
+    },
+    scoreboard,
+    challenges,
+  };
+}
+
+function applyPlatformSnapshotToChallenges(challenges, snapshot) {
+  const next = [...challenges];
+  snapshot.challenges.forEach(pc => {
+    const idx = next.findIndex(c =>
+      (pc.platformId && c.platformId === pc.platformId) ||
+      c.title.trim().toLowerCase() === pc.title.trim().toLowerCase()
+    );
+    const patch = {
+      title: pc.title,
+      category: pc.category,
+      points: pc.currentPoints || next[idx]?.points || 0,
+      platformId: pc.platformId,
+      platformSource: pc.platformSource,
+      platformPoints: pc.currentPoints,
+      platformMaxPoints: pc.maxPoints ?? next[idx]?.platformMaxPoints ?? pc.currentPoints,
+      platformSolveCount: pc.solveCount,
+      platformSolved: pc.ourSolved,
+      rankImpact: pc.rankImpact ?? next[idx]?.rankImpact ?? null,
+      status: pc.ourSolved ? 'solved' : next[idx]?.status || 'unsolved',
+      solvedAt: pc.ourSolved ? (next[idx]?.solvedAt || Date.now()) : next[idx]?.solvedAt || null,
+    };
+    if (idx >= 0) next[idx] = migrate({ ...next[idx], ...patch });
+    else next.push(newChallenge(patch));
+  });
+  return next;
+}
 
 // ============================================================
 // STORAGE
 // ============================================================
 const SHARED = true;
 const CH_PREFIX = 'challenge:';
+const SNAPSHOT_PREFIX = 'platform-snapshot:';
+const MEETING_PREFIX = 'meeting:';
 const TEAM_KEY = 'team-roster';
 const SETTINGS_KEY = 'event-settings';
 
 const DEFAULT_SETTINGS = {
   eventName: 'COACH COMMAND CENTER', competitionDay: 'jeopardy',
-  startTime: null, hrHours: DEFAULT_HR_HOURS, ruHours: DEFAULT_RU_HOURS,
+  startTime: null,
+  durationHours: DEFAULT_DURATION_HOURS,
+  useLockedPhase: false,
+  lockedPhaseHours: DEFAULT_HR_HOURS,
+  lockedPhaseLabel: 'Phase 1',
+  openPhaseLabel: 'Phase 2',
   subsUsed: 0,
 };
+
+function migrateSettings(raw) {
+  const s = { ...DEFAULT_SETTINGS, ...raw };
+  // Coerce old A&D competition day
+  if (s.competitionDay === 'ad') s.competitionDay = 'jeopardy';
+  // Migrate hrHours/ruHours -> locked-phase model
+  if ((s.hrHours != null || s.ruHours != null) && s.durationHours === DEFAULT_DURATION_HOURS && !s.useLockedPhase) {
+    const hr = s.hrHours ?? DEFAULT_HR_HOURS;
+    const ru = s.ruHours ?? DEFAULT_RU_HOURS;
+    s.durationHours = hr + ru;
+    s.useLockedPhase = true;
+    s.lockedPhaseHours = hr;
+    s.lockedPhaseLabel = 'Human Resistance';
+    s.openPhaseLabel = 'Robot Uprising';
+  }
+  // hrHours / ruHours kept for one release cycle for safety
+  return s;
+}
 
 const storage = {
   async listChallenges() {
@@ -160,6 +411,36 @@ const storage = {
     try { await window.storage.delete(`${CH_PREFIX}${id}`, SHARED); return true; }
     catch (e) { console.error('deleteChallenge', e); return false; }
   },
+  async listPlatformSnapshots() {
+    try {
+      const res = await window.storage.list(SNAPSHOT_PREFIX, SHARED);
+      const keys = res?.keys || [];
+      const items = await Promise.all(keys.map(async (k) => {
+        try { const r = await window.storage.get(k, SHARED); return r ? JSON.parse(r.value) : null; }
+        catch { return null; }
+      }));
+      return items.filter(Boolean).sort((a, b) => (b.importedAt || 0) - (a.importedAt || 0));
+    } catch (e) { console.error('listPlatformSnapshots', e); return []; }
+  },
+  async savePlatformSnapshot(snapshot) {
+    try { await window.storage.set(snapshot.id, JSON.stringify(snapshot), SHARED); return true; }
+    catch (e) { console.error('savePlatformSnapshot', e); return false; }
+  },
+  async listMeetings() {
+    try {
+      const res = await window.storage.list(MEETING_PREFIX, SHARED);
+      const keys = res?.keys || [];
+      const items = await Promise.all(keys.map(async (k) => {
+        try { const r = await window.storage.get(k, SHARED); return r ? JSON.parse(r.value) : null; }
+        catch { return null; }
+      }));
+      return items.filter(Boolean).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    } catch (e) { console.error('listMeetings', e); return []; }
+  },
+  async saveMeeting(meeting) {
+    try { await window.storage.set(meeting.id, JSON.stringify(meeting), SHARED); return true; }
+    catch (e) { console.error('saveMeeting', e); return false; }
+  },
   async getRoster() {
     try { const r = await window.storage.get(TEAM_KEY, SHARED); return r ? migrateRoster(JSON.parse(r.value)) : []; }
     catch { return []; }
@@ -171,7 +452,7 @@ const storage = {
   async getSettings() {
     try {
       const r = await window.storage.get(SETTINGS_KEY, SHARED);
-      return r ? { ...DEFAULT_SETTINGS, ...JSON.parse(r.value) } : DEFAULT_SETTINGS;
+      return r ? migrateSettings(JSON.parse(r.value)) : DEFAULT_SETTINGS;
     } catch { return DEFAULT_SETTINGS; }
   },
   async saveSettings(s) {
@@ -187,6 +468,139 @@ const storage = {
     } catch (e) { console.error('clearAll', e); return false; }
   },
 };
+
+function phaseValueRisk(challenge, settings, phase) {
+  const points = challenge.platformPoints ?? challenge.points ?? 0;
+  if (!settings.startTime || !(settings.useLockedPhase ?? false) || phase.phase !== 'locked') return 0;
+  const hoursRemaining = Math.max(0, (phase.phaseRemaining || 0) / 3600_000);
+  const urgency = hoursRemaining <= 0.5 ? 1 : hoursRemaining <= 1 ? 0.8 : hoursRemaining <= 2 ? 0.55 : 0.3;
+  return Math.round(points * urgency);
+}
+
+function confidenceWeight(value, dict) {
+  return (dict[value] || dict.unknown).weight;
+}
+
+function estimateRankImpact(challenge, snapshot) {
+  if (challenge.rankImpact != null) return challenge.rankImpact;
+  const points = challenge.platformPoints ?? challenge.points ?? 0;
+  const board = snapshot?.scoreboard;
+  if (!points || !board) return Math.round(points * 0.12);
+  const gapAbove = Number(board.gapAbove || 0);
+  const gapBelow = Number(board.gapBelow || 0);
+  let impact = Math.round(points * 0.12);
+  if (gapAbove > 0) {
+    if (points >= gapAbove) impact += 110;
+    else if (points >= gapAbove * 0.7) impact += 75;
+    else if (points >= gapAbove * 0.4) impact += 45;
+  }
+  if (gapBelow > 0 && points >= gapBelow) impact += 25;
+  return impact;
+}
+
+function resourceFitForChallenge(challenge, roster) {
+  const active = roster.filter(p => p.status !== 'subbed-out' && p.availabilityStatus !== 'resting');
+  const matching = active.filter(p => (p.strengths || []).includes(challenge.category));
+  const available = matching.filter(p => p.availabilityStatus !== 'loaded' && p.availabilityStatus !== 'fatigued');
+  return { matching, available };
+}
+
+function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) {
+  const currentPoints = challenge.platformPoints ?? challenge.points ?? 0;
+  const progress = Number(challenge.captainProgress ?? 0);
+  const timeSpent = Number(challenge.captainTimeSpentMinutes ?? 0);
+  const solveCount = Number(challenge.platformSolveCount ?? 0);
+  const assigneeCount = challenge.assignees?.length || 0;
+  const phaseRisk = phaseValueRisk(challenge, settings, phase);
+  const rankImpact = estimateRankImpact(challenge, snapshot);
+  const captainConfidence = confidenceWeight(challenge.captainConfidence, CAPTAIN_CONFIDENCE);
+  const phaseConfidence = confidenceWeight(challenge.phaseSolveConfidence, PHASE_SOLVE_CONFIDENCE);
+  const fit = resourceFitForChallenge(challenge, roster);
+  const iccRec = computeIccRecommendation(challenge, {
+    competition: snapshot?.competition,
+    phase,
+    fit,
+  });
+  const staleMeeting = !challenge.lastMeetingAt || Date.now() - challenge.lastMeetingAt > 90 * 60_000;
+  const opportunityCost = assigneeCount * Math.max(1, Math.round(timeSpent / 30));
+  const externalSignal = solveCount === 0 ? -8 : Math.min(40, solveCount * 4);
+
+  let score = currentPoints + phaseRisk + rankImpact + (captainConfidence * 2) + phaseConfidence + progress + externalSignal;
+  score -= opportunityCost * 10;
+  if (challenge.status === 'stuck') score -= 20;
+  if (challenge.resourceNeed === 'drop' || challenge.coachDecision === 'drop' || challenge.coachDecision === 'park') score -= 90;
+  if (challenge.coachDecision === 'phase_priority') score += 65;
+  if (challenge.resourceNeed === 'operator' || challenge.resourceNeed === 'specialist') score += fit.available.length > 0 ? 25 : 5;
+  score += iccRecommendationScoreBoost(iccRec);
+
+  const reasons = [];
+  if (currentPoints > 0) reasons.push(`${currentPoints} current points`);
+  if (rankImpact >= 80) reasons.push('could change scoreboard position');
+  else if (rankImpact > 0) reasons.push(`${rankImpact} rank-impact estimate`);
+  if (phaseRisk > 0) reasons.push(`${phaseRisk} phase value-at-risk before score freeze`);
+  if (challenge.captainConfidence && challenge.captainConfidence !== 'unknown') reasons.push(`${CAPTAIN_CONFIDENCE[challenge.captainConfidence]?.label} captain confidence`);
+  if (challenge.phaseSolveConfidence && challenge.phaseSolveConfidence !== 'unknown') reasons.push(`${PHASE_SOLVE_CONFIDENCE[challenge.phaseSolveConfidence]?.label} before phase change`);
+  if (progress > 0) reasons.push(`${progress}% progress detail`);
+  if (timeSpent > 0) reasons.push(`${timeSpent}m already invested`);
+  if (solveCount > 0) reasons.push(`${solveCount} public solve${solveCount === 1 ? '' : 's'} suggests feasibility`);
+  else if (challenge.platformId) reasons.push('no public solves yet');
+  if (assigneeCount > 0) reasons.push(`${assigneeCount} operator${assigneeCount === 1 ? '' : 's'} assigned`);
+  if (challenge.resourceNeed && challenge.resourceNeed !== 'none') reasons.push(RESOURCE_NEEDS[challenge.resourceNeed]?.label || challenge.resourceNeed);
+  if (staleMeeting) reasons.push('needs fresh captain report');
+  if (iccRec?.reasons?.length) reasons.push(...iccRec.reasons.slice(0, 2));
+
+  const missingConfidence = !challenge.captainConfidence || challenge.captainConfidence === 'unknown' || !challenge.phaseSolveConfidence || challenge.phaseSolveConfidence === 'unknown';
+  let lane = 'ask';
+  if (challenge.status === 'solved' || challenge.platformSolved) lane = 'solved';
+  else if (challenge.resourceNeed === 'drop' || challenge.coachDecision === 'drop' || challenge.coachDecision === 'park' || (captainConfidence <= 20 && timeSpent >= 90 && currentPoints < 250)) lane = 'drop';
+  else if (missingConfidence || staleMeeting) lane = 'ask';
+  else if (rankImpact >= 80) lane = 'win';
+  else if (phaseRisk > 0 && (phaseConfidence >= 45 || captainConfidence >= 45)) lane = 'lock';
+  else if (challenge.resourceNeed === 'operator' || challenge.resourceNeed === 'specialist' || challenge.resourceNeed === 'rest' || challenge.status === 'stuck') lane = 'resource';
+  else if (captainConfidence >= 45 || progress >= 25) lane = 'continue';
+
+  const questionPrompts = [];
+  if (challenge.captainConfidence === 'unknown') questionPrompts.push('Ask captain: low, medium, high, or near-solved confidence?');
+  if (phaseRisk > 0 && challenge.phaseSolveConfidence === 'unknown') questionPrompts.push('Ask whether this can realistically solve before the phase freeze.');
+  if (staleMeeting) questionPrompts.push('Get current operators assigned and whether to add, swap, or drop resources.');
+  if (captainConfidence < 45 && timeSpent > 45) questionPrompts.push('Ask if continued time is likely to convert into points before the next meeting.');
+  if (challenge.resourceNeed === 'operator' || challenge.resourceNeed === 'specialist') questionPrompts.push(`Ask whether ${fit.available.length ? fit.available.map(p => p.name).slice(0, 3).join(', ') : 'another specialist'} would materially improve odds.`);
+  if (!questionPrompts.length) questionPrompts.push('Confirm progress confidence and next resource decision.');
+
+  return {
+    challenge,
+    lane,
+    score: Math.round(score),
+    currentPoints,
+    phaseRisk,
+    rankImpact,
+    progress,
+    timeSpent,
+    opportunityCost,
+    captainConfidence,
+    phaseConfidence,
+    resourceFit: fit,
+    iccRec,
+    reasons,
+    questionPrompts,
+  };
+}
+
+function buildInsights(challenges, roster, settings, phase, snapshot) {
+  const lanes = {
+    win: { label: 'WIN IMPACT', color: '#d4a843', items: [] },
+    lock: { label: 'LOCK BEFORE PHASE', color: '#f59e0b', items: [] },
+    ask: { label: 'ASK CAPTAINS', color: '#06b6d4', items: [] },
+    resource: { label: 'RESOURCE SHIFT', color: '#a855f7', items: [] },
+    continue: { label: 'CONTINUE', color: '#10b981', items: [] },
+    drop: { label: 'DROP OR PARK', color: '#ef4444', items: [] },
+    solved: { label: 'SOLVED / VERIFIED', color: '#10b981', items: [] },
+  };
+  challenges.map(ch => buildInsightForChallenge(ch, roster, settings, phase, snapshot))
+    .forEach(insight => lanes[insight.lane].items.push(insight));
+  Object.values(lanes).forEach(lane => lane.items.sort((a, b) => b.score - a.score));
+  return lanes;
+}
 
 // ============================================================
 // USCT LOGO (inline SVG)
@@ -336,12 +750,23 @@ export default function CoachCommandCenter() {
   const [challenges, setChallenges] = useState([]);
   const [roster, setRoster] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [platformSnapshots, setPlatformSnapshots] = useState([]);
+  const [meetings, setMeetings] = useState([]);
+  const [iccSync, setIccSync] = useState({
+    configured: false,
+    status: 'idle',
+    error: null,
+    lastSyncAt: null,
+    alerts: [],
+  });
   const [loading, setLoading] = useState(true);
   const [tick, setTick] = useState(0);
+  const iccSyncInFlight = useRef(false);
 
   const [view, setView] = useState('challenges');
   const [selectedId, setSelectedId] = useState(null);
   const [selectedOp, setSelectedOp] = useState(null);
+  const [meetingChallengeId, setMeetingChallengeId] = useState(null);
   const [showRoster, setShowRoster] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [search, setSearch] = useState('');
@@ -354,10 +779,11 @@ export default function CoachCommandCenter() {
 
   useEffect(() => {
     (async () => {
-      const [chs, rs, st] = await Promise.all([
+      const [chs, rs, st, ps, ms] = await Promise.all([
         storage.listChallenges(), storage.getRoster(), storage.getSettings(),
+        storage.listPlatformSnapshots(), storage.listMeetings(),
       ]);
-      setChallenges(chs); setRoster(rs); setSettings(st); setLoading(false);
+      setChallenges(chs); setRoster(rs); setSettings(st); setPlatformSnapshots(ps); setMeetings(ms); setLoading(false);
     })();
   }, []);
 
@@ -375,10 +801,11 @@ export default function CoachCommandCenter() {
   }, []);
 
   const refresh = useCallback(async () => {
-    const [chs, rs, st] = await Promise.all([
+    const [chs, rs, st, ps, ms] = await Promise.all([
       storage.listChallenges(), storage.getRoster(), storage.getSettings(),
+      storage.listPlatformSnapshots(), storage.listMeetings(),
     ]);
-    setChallenges(chs); setRoster(rs); setSettings(st);
+    setChallenges(chs); setRoster(rs); setSettings(st); setPlatformSnapshots(ps); setMeetings(ms);
   }, []);
 
   const upsertChallenge = useCallback(async (ch) => {
@@ -390,6 +817,112 @@ export default function CoachCommandCenter() {
     });
     await storage.saveChallenge(updated);
   }, []);
+
+  const savePlatformSnapshot = useCallback(async (snapshot) => {
+    const merged = applyPlatformSnapshotToChallenges(challenges, snapshot);
+    setPlatformSnapshots(prev => [snapshot, ...prev].sort((a, b) => (b.importedAt || 0) - (a.importedAt || 0)));
+    setChallenges(merged);
+    await storage.savePlatformSnapshot(snapshot);
+    await Promise.all(merged.map(ch => storage.saveChallenge({ ...ch, updatedAt: Date.now() })));
+  }, [challenges]);
+
+  const syncIccFromApi = useCallback(async () => {
+    if (iccSyncInFlight.current) return;
+    iccSyncInFlight.current = true;
+    setIccSync(s => ({ ...s, status: s.configured ? 'loading' : s.status }));
+    try {
+      const bundle = await fetchIccBundle();
+      const snapshot = buildSnapshotFromIccBundle(bundle);
+      const alerts = buildIccAlerts(bundle);
+      setIccSync({
+        configured: true,
+        status: 'ok',
+        error: null,
+        lastSyncAt: Date.now(),
+        alerts,
+      });
+      setChallenges(prev => {
+        const merged = applyPlatformSnapshotToChallenges(prev, snapshot);
+        storage.savePlatformSnapshot(snapshot);
+        merged.forEach(ch => storage.saveChallenge({ ...ch, updatedAt: Date.now() }));
+        return merged;
+      });
+      setPlatformSnapshots(prev => {
+        const rest = prev.filter(s => s.id !== snapshot.id);
+        return [snapshot, ...rest].slice(0, 30);
+      });
+    } catch (e) {
+      setIccSync(s => ({
+        ...s,
+        configured: s.configured,
+        status: 'error',
+        error: e?.message || 'ICC sync failed',
+      }));
+    } finally {
+      iccSyncInFlight.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+
+    (async () => {
+      const statusRes = await fetchIccStatus().catch(() => ({ configured: false }));
+      if (cancelled) return;
+      if (!statusRes.configured) {
+        setIccSync(s => ({ ...s, configured: false, status: 'idle' }));
+        return;
+      }
+      setIccSync(s => ({ ...s, configured: true }));
+      const tick = async () => {
+        if (cancelled) return;
+        await syncIccFromApi();
+        if (!cancelled) timer = setTimeout(tick, 15000);
+      };
+      await tick();
+    })();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [syncIccFromApi]);
+
+  const saveMeetingUpdate = useCallback(async (challengeId, update) => {
+    const now = Date.now();
+    const meeting = {
+      id: `${MEETING_PREFIX}${now}`,
+      createdAt: now,
+      challengeId,
+      ...update,
+    };
+    const ch = challenges.find(c => c.id === challengeId);
+    if (!ch) return;
+    const updatedChallenge = migrate({
+      ...ch,
+      assignees: update.assignees,
+      captainProgress: update.captainProgress,
+      captainTimeSpentMinutes: update.captainTimeSpentMinutes,
+      captainConfidence: update.captainConfidence,
+      phaseSolveConfidence: update.phaseSolveConfidence,
+      resourceAskCategory: update.resourceAskCategory,
+      resourceAskName: update.resourceAskName,
+      resourceNeed: update.resourceNeed,
+      coachDecision: update.coachDecision,
+      lastMeetingAt: now,
+      meetingHistory: [...(ch.meetingHistory || []), meeting].slice(-20),
+    });
+    await upsertChallenge(updatedChallenge);
+    setMeetings(prev => [meeting, ...prev]);
+    await storage.saveMeeting(meeting);
+  }, [challenges, upsertChallenge]);
+
+  const quickUpdateChallenge = useCallback(async (challengeId, patch) => {
+    const ch = challenges.find(c => c.id === challengeId);
+    if (!ch) return;
+    await upsertChallenge(migrate({ ...ch, ...patch }));
+  }, [challenges, upsertChallenge]);
 
   // ROBUST DELETE: optimistic local removal, then storage delete, then verify
   const removeChallenge = useCallback(async (id) => {
@@ -412,12 +945,34 @@ export default function CoachCommandCenter() {
     setChallenges([]);
     setRoster([]);
     setSettings(DEFAULT_SETTINGS);
+    setPlatformSnapshots([]);
+    setMeetings([]);
     setShowRoster(false);
   }, []);
 
   const activeRoster = useMemo(() => roster.filter(p => p.status !== 'subbed-out'), [roster]);
 
   const phase = useMemo(() => getPhase(settings), [settings, tick]);
+
+  const liveSnapshot = useMemo(
+    () => platformSnapshots.find(s => s.source === 'icc') || platformSnapshots[0],
+    [platformSnapshots],
+  );
+
+  const insightLanes = useMemo(
+    () => buildInsights(challenges, activeRoster, settings, phase, liveSnapshot),
+    [challenges, activeRoster, settings, phase, liveSnapshot, tick],
+  );
+
+  const iccRecommendations = useMemo(() => {
+    const comp = liveSnapshot?.competition;
+    const map = new Map();
+    for (const ch of challenges) {
+      const fit = resourceFitForChallenge(ch, activeRoster);
+      map.set(ch.id, computeIccRecommendation(ch, { competition: comp, phase, fit }));
+    }
+    return map;
+  }, [challenges, activeRoster, liveSnapshot, phase]);
 
   const visible = useMemo(() => {
     let arr = challenges;
@@ -468,12 +1023,13 @@ export default function CoachCommandCenter() {
       key: k, total: challenges.filter(c => c.category === k).length,
       solved: challenges.filter(c => c.category === k && c.status === 'solved').length,
     }));
-    const solvedHR = challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').length;
-    const pointsHR = challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').reduce((s, c) => s + (c.points || 0), 0);
+    const solvedHR = challenges.filter(c => solvedPhase(c, settings) === 'locked').length;
+    const pointsHR = challenges.filter(c => solvedPhase(c, settings) === 'locked').reduce((s, c) => s + (c.points || 0), 0);
     return { total, solved, inProg, stuck, points, totalOps, engagedOps: engagedOps.size, byCat, solvedHR, pointsHR };
   }, [challenges, activeRoster, settings, tick]);
 
   const selected = challenges.find(c => c.id === selectedId);
+  const meetingChallenge = challenges.find(c => c.id === meetingChallengeId);
   const subsRemaining = MAX_SUBS_PER_DAY - (settings.subsUsed || 0);
 
   const staleAlerts = useMemo(() => {
@@ -599,7 +1155,7 @@ export default function CoachCommandCenter() {
           <StatCard label="ENGAGED" value={stats.inProg} icon={<Activity size={14} />} accent="#f59e0b" />
           <StatCard label="STUCK" value={stats.stuck} icon={<AlertCircle size={14} />} accent="#dc2626" />
           <StatCard label="OPS ENGAGED" value={`${stats.engagedOps}/${stats.totalOps}`} icon={<UserCheck size={14} />} accent="#d4a843" />
-          {settings.competitionDay === 'jeopardy' && settings.startTime ? (
+          {settings.startTime ? (
             <StatCard label="LOCKED IN HR" value={`${stats.solvedHR} · ${stats.pointsHR}pt`} icon={<Lock size={14} />} accent="#10b981" />
           ) : (
             <StatCard label="POINTS" value={stats.points} icon={<Award size={14} />} accent="#d4a843" />
@@ -645,6 +1201,9 @@ export default function CoachCommandCenter() {
           <TabBtn active={view === 'operators'} onClick={() => setView('operators')}
             icon={<Users size={14} />} label="OPERATORS" count={activeRoster.length}
             badge={stats.engagedOps > 0 ? `${stats.engagedOps} ENGAGED` : null} />
+          <TabBtn active={view === 'meetings'} onClick={() => setView('meetings')}
+            icon={<Radio size={14} />} label="MEETINGS" count={Object.values(insightLanes).reduce((n, lane) => n + (lane.label === 'SOLVED / VERIFIED' ? 0 : lane.items.length), 0)}
+            badge={iccSync.configured ? 'ICC LIVE' : platformSnapshots.length ? 'PLATFORM' : 'MANUAL'} />
         </div>
 
         {view === 'challenges' && (
@@ -689,6 +1248,7 @@ export default function CoachCommandCenter() {
               }}>
                 {visible.map(c => (
                   <ChallengeCard key={c.id} challenge={c} settings={settings}
+                    iccRec={iccRecommendations.get(c.id)}
                     onClick={() => setSelectedId(c.id)}
                     onToggleStar={() => upsertChallenge({ ...c, starred: !c.starred })} />
                 ))}
@@ -705,6 +1265,25 @@ export default function CoachCommandCenter() {
             onAddOperator={() => setShowRoster(true)} />
         )}
 
+        {view === 'meetings' && (
+          <MeetingsView
+            challenges={challenges}
+            roster={activeRoster}
+            settings={settings}
+            phase={phase}
+            lanes={insightLanes}
+            snapshots={platformSnapshots}
+            meetings={meetings}
+            iccSync={iccSync}
+            iccRecommendations={iccRecommendations}
+            onIccSyncNow={syncIccFromApi}
+            onImportSnapshot={savePlatformSnapshot}
+            onQuickUpdate={quickUpdateChallenge}
+            onOpenChallenge={setSelectedId}
+            onUpdateMeeting={setMeetingChallengeId}
+            onConfigureRoster={() => setShowRoster(true)} />
+        )}
+
         <footer style={{
           marginTop: 60, paddingTop: 20, borderTop: '1px solid rgba(255,255,255,0.06)',
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
@@ -712,7 +1291,11 @@ export default function CoachCommandCenter() {
         }}>
           <div>◆ COACH COMMAND CENTER · USCT · ICC 2026</div>
           <div style={{ fontFamily: '"JetBrains Mono", monospace' }}>
-            {view === 'challenges' ? `SHOWING ${visible.length} / ${challenges.length}` : `${activeRoster.length} ACTIVE OPERATOR${activeRoster.length === 1 ? '' : 'S'}`}
+            {view === 'challenges'
+              ? `SHOWING ${visible.length} / ${challenges.length}`
+              : view === 'operators'
+                ? `${activeRoster.length} ACTIVE OPERATOR${activeRoster.length === 1 ? '' : 'S'}`
+                : `${meetings.length} MEETING UPDATE${meetings.length === 1 ? '' : 'S'}`}
           </div>
         </footer>
       </div>
@@ -735,6 +1318,8 @@ export default function CoachCommandCenter() {
       )}
       {showRoster && (
         <RosterModal roster={roster} settings={settings} challenges={challenges}
+          platformSnapshots={platformSnapshots}
+          meetings={meetings}
           subsRemaining={subsRemaining}
           onClose={() => setShowRoster(false)}
           onSaveRoster={saveRoster}
@@ -746,6 +1331,16 @@ export default function CoachCommandCenter() {
           onClose={() => setSelectedOp(null)}
           onOpenChallenge={(id) => { setSelectedOp(null); setSelectedId(id); }} />
       )}
+      {meetingChallenge && (
+        <MeetingUpdateModal
+          challenge={meetingChallenge}
+          roster={activeRoster}
+          onClose={() => setMeetingChallengeId(null)}
+          onSave={async (update) => {
+            await saveMeetingUpdate(meetingChallenge.id, update);
+            setMeetingChallengeId(null);
+          }} />
+      )}
     </div>
   );
 }
@@ -756,7 +1351,6 @@ export default function CoachCommandCenter() {
 
 function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) {
   const day = COMP_DAYS[settings.competitionDay] || COMP_DAYS.jeopardy;
-  const isJeopardy = settings.competitionDay === 'jeopardy';
 
   if (phase.phase === 'pending') {
     return (
@@ -772,7 +1366,7 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
               ◆ COMPETITION TIMER NOT SET
             </div>
             <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.65)', marginTop: 2 }}>
-              Set the start time and day type to begin tracking competition phase (Human Resistance / Robot Uprising).
+              Set the start time in settings to begin tracking competition phase.
             </div>
           </div>
         </div>
@@ -839,16 +1433,37 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
     );
   }
 
-  const isHR = phase.phase === 'human-resistance';
-  const phaseColor = isHR ? '#d4a843' : '#ef4444';
-  const phaseIcon = isHR ? <ShieldAlert size={20} /> : <Cpu size={20} />;
-  const phaseLabel = isHR ? 'HUMAN RESISTANCE' : 'ROBOT UPRISING';
-  const phaseDesc = isHR ? 'Simple AI only · Score-lock zone' : 'Approved AI enabled · Score decaying';
+  // Active phase: 'in-progress', 'locked', or 'open'
+  const useLockedPhase = settings.useLockedPhase ?? false;
+  const isLocked = phase.phase === 'locked';
+  const isInProgress = phase.phase === 'in-progress';
 
-  const showLockUrgent = isJeopardy && isHR && phase.phaseRemaining <= LOCK_URGENT_MS;
-  const showLockWarn = isJeopardy && isHR && phase.phaseRemaining <= LOCK_WARN_MS && !showLockUrgent;
+  let phaseColor, phaseIcon, phaseLabel, phaseDesc, showLockUrgent, showLockWarn;
 
-  const hrPct = (phase.hrMs / phase.totalMs) * 100;
+  if (!useLockedPhase || isInProgress) {
+    phaseColor = '#d4a843';
+    phaseIcon = <Activity size={20} />;
+    phaseLabel = 'IN PROGRESS';
+    phaseDesc = `${fmtCountdown(phase.phaseRemaining)} remaining`;
+    showLockUrgent = false;
+    showLockWarn = false;
+  } else if (isLocked) {
+    phaseColor = '#d4a843';
+    phaseIcon = <ShieldAlert size={20} />;
+    phaseLabel = (settings.lockedPhaseLabel || 'Phase 1').toUpperCase();
+    phaseDesc = 'Score-lock zone · lock triggers at phase end';
+    showLockUrgent = phase.phaseRemaining <= LOCK_URGENT_MS;
+    showLockWarn = phase.phaseRemaining <= LOCK_WARN_MS && !showLockUrgent;
+  } else {
+    phaseColor = '#ef4444';
+    phaseIcon = <Cpu size={20} />;
+    phaseLabel = (settings.openPhaseLabel || 'Phase 2').toUpperCase();
+    phaseDesc = 'Open phase · scores decaying';
+    showLockUrgent = false;
+    showLockWarn = false;
+  }
+
+  const lockedPct = useLockedPhase && !isInProgress ? (phase.lockedMs / phase.totalMs) * 100 : 100;
   const elapsedPct = Math.min(100, (phase.elapsed / phase.totalMs) * 100);
 
   return (
@@ -892,7 +1507,7 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
         <div style={{ display: 'flex', gap: 20, alignItems: 'center' }}>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: 9, letterSpacing: '0.2em', color: 'rgba(255,255,255,0.5)' }}>
-              {isHR ? 'SCORE LOCK IN' : 'COMPETITION ENDS'}
+              {isLocked ? 'SCORE LOCK IN' : 'COMPETITION ENDS'}
             </div>
             <div style={{
               fontFamily: '"JetBrains Mono", monospace', fontSize: 24, fontWeight: 700,
@@ -909,18 +1524,24 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
       </div>
 
       <div style={{ position: 'relative', height: 10, background: 'rgba(0,0,0,0.4)', borderRadius: 2, overflow: 'hidden', marginBottom: 4 }}>
-        <div style={{
-          position: 'absolute', left: 0, top: 0, bottom: 0, width: `${hrPct}%`,
-          background: 'rgba(212, 168, 67, 0.15)',
-          borderRight: '1px solid rgba(255,255,255,0.3)',
-        }} />
-        <div style={{
-          position: 'absolute', left: `${hrPct}%`, top: 0, bottom: 0, right: 0,
-          background: 'rgba(239, 68, 68, 0.15)',
-        }} />
+        {useLockedPhase && !isInProgress && (
+          <>
+            <div style={{
+              position: 'absolute', left: 0, top: 0, bottom: 0, width: `${lockedPct}%`,
+              background: 'rgba(212, 168, 67, 0.15)',
+              borderRight: '1px solid rgba(255,255,255,0.3)',
+            }} />
+            <div style={{
+              position: 'absolute', left: `${lockedPct}%`, top: 0, bottom: 0, right: 0,
+              background: 'rgba(239, 68, 68, 0.15)',
+            }} />
+          </>
+        )}
         <div style={{
           position: 'absolute', left: 0, top: 0, bottom: 0, width: `${elapsedPct}%`,
-          background: `linear-gradient(90deg, #d4a843 0%, #d4a843 ${hrPct/Math.max(elapsedPct,0.01)*100}%, #ef4444 100%)`,
+          background: useLockedPhase && !isInProgress
+            ? `linear-gradient(90deg, #d4a843 0%, #d4a843 ${lockedPct/Math.max(elapsedPct,0.01)*100}%, #ef4444 100%)`
+            : '#d4a843',
           opacity: 0.85,
         }} />
         <div style={{
@@ -928,14 +1549,16 @@ function CompetitionPanel({ phase, settings, onConfigureTime, onSaveSettings }) 
           background: '#fff', boxShadow: '0 0 8px #fff',
         }} />
       </div>
-      <div style={{
-        display: 'flex', justifyContent: 'space-between', fontSize: 9, letterSpacing: '0.15em',
-        color: 'rgba(255,255,255,0.4)', fontFamily: '"JetBrains Mono", monospace',
-      }}>
-        <span>HR · {settings.hrHours ?? DEFAULT_HR_HOURS}H</span>
-        <span style={{ color: phaseColor }}>▲ NOW</span>
-        <span>RU · {settings.ruHours ?? DEFAULT_RU_HOURS}H</span>
-      </div>
+      {useLockedPhase && !isInProgress && (
+        <div style={{
+          display: 'flex', justifyContent: 'space-between', fontSize: 9, letterSpacing: '0.15em',
+          color: 'rgba(255,255,255,0.4)', fontFamily: '"JetBrains Mono", monospace',
+        }}>
+          <span>{(settings.lockedPhaseLabel || 'Phase 1').toUpperCase()} · {settings.lockedPhaseHours ?? DEFAULT_HR_HOURS}H</span>
+          <span style={{ color: phaseColor }}>▲ NOW</span>
+          <span>{(settings.openPhaseLabel || 'Phase 2').toUpperCase()} · {Math.max(0, (settings.durationHours ?? DEFAULT_DURATION_HOURS) - (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS))}H</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -1008,12 +1631,11 @@ function StatCard({ label, value, icon, accent = '#d4a843', sub }) {
 // CHALLENGE CARD
 // ============================================================
 
-function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
+function ChallengeCard({ challenge, settings, iccRec, onClick, onToggleStar }) {
   const cat = CATEGORIES[challenge.category] || CATEGORIES.misc;
   const stat = STATUSES[challenge.status];
   const isSolved = challenge.status === 'solved';
   const solvedIn = solvedPhase(challenge, settings);
-  const isJeopardy = settings.competitionDay === 'jeopardy';
   const isStale = (challenge.status === 'in-progress' || challenge.status === 'stuck') &&
                   (Date.now() - challenge.updatedAt) > STALE_THRESHOLD_MS;
 
@@ -1051,24 +1673,29 @@ function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
               {challenge.points} PT
             </span>
           )}
-          {solvedIn === 'human-resistance' && (
-            <span title={isJeopardy ? 'Score locked at end-of-HR value' : 'Solved during Human Resistance phase'} style={{
+          {solvedIn === 'locked' && (
+            <span title="Score locked at end of locked phase" style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
               fontSize: 9, padding: '2px 6px', background: 'rgba(16,185,129,0.12)',
               border: '1px solid rgba(16,185,129,0.4)', color: '#10b981',
               borderRadius: 2, letterSpacing: '0.1em', fontWeight: 600,
             }}>
-              <Lock size={9} /> {isJeopardy ? 'LOCKED' : 'HR'}
+              <Lock size={9} /> LOCKED
             </span>
           )}
-          {solvedIn === 'robot-uprising' && (
-            <span title="Solved during Robot Uprising phase" style={{
+          {solvedIn === 'open' && (
+            <span title="Solved during open phase" style={{
               fontSize: 9, padding: '2px 6px', background: 'rgba(239,68,68,0.12)',
               border: '1px solid rgba(239,68,68,0.4)', color: '#ef4444',
               borderRadius: 2, letterSpacing: '0.1em', fontWeight: 600,
             }}>
-              <Cpu size={9} style={{ verticalAlign: -1, marginRight: 2 }} />RU
+              <Cpu size={9} style={{ verticalAlign: -1, marginRight: 2 }} />OPEN
             </span>
+          )}
+          {iccRec && ICC_RECOMMENDATIONS[iccRec.key] && (
+            <Badge color={ICC_RECOMMENDATIONS[iccRec.key].color} title={iccRec.reasons?.join(' · ')}>
+              {ICC_RECOMMENDATIONS[iccRec.key].label}
+            </Badge>
           )}
         </div>
         <button onClick={(e) => { e.stopPropagation(); onToggleStar(); }} style={{
@@ -1144,6 +1771,564 @@ function ChallengeCard({ challenge, settings, onClick, onToggleStar }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ============================================================
+// MEETINGS / INSIGHTS VIEW
+// ============================================================
+
+function IccLivePanel({ iccSync, liveSnapshot, onSyncNow }) {
+  const { configured, status, error, lastSyncAt, alerts } = iccSync;
+  if (!configured) return null;
+
+  const board = liveSnapshot?.scoreboard;
+  const statusColor = status === 'error' ? '#ef4444' : status === 'loading' ? '#f59e0b' : '#10b981';
+
+  return (
+    <div style={{
+      padding: 14, marginBottom: 16,
+      background: 'linear-gradient(135deg, rgba(16,185,129,0.08), rgba(212,168,67,0.05))',
+      border: '1px solid rgba(16,185,129,0.28)', borderRadius: 4,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+        <div>
+          <SectionLabel icon={<Activity size={11} />}>ICC LIVE · TEAM USA</SectionLabel>
+          <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.72)', lineHeight: 1.5 }}>
+            Auto-sync every 15s via server proxy.
+            {board?.ourRank != null && (
+              <> Rank <b style={{ color: '#d4a843' }}>#{board.ourRank}</b> · {Number(board.ourScore ?? 0).toLocaleString()} pts</>
+            )}
+            {board?.gapAbove > 0 && <> · {board.gapAbove} to next</>}
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%', background: statusColor,
+            boxShadow: status === 'ok' ? `0 0 8px ${statusColor}` : 'none',
+          }} />
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.55)' }}>
+            {status === 'loading' ? 'Syncing…' : lastSyncAt ? fmtRelative(lastSyncAt) : 'pending'}
+          </span>
+          <GhostBtn onClick={onSyncNow} disabled={status === 'loading'}>
+            <RefreshCw size={12} /> Sync now
+          </GhostBtn>
+        </div>
+      </div>
+      {error && (
+        <div style={{ fontSize: 11, color: '#ef4444', marginBottom: 8 }}>{error}</div>
+      )}
+      {alerts.length > 0 && (
+        <div style={{ display: 'grid', gap: 6 }}>
+          {alerts.map(a => (
+            <div key={a.message} style={{
+              fontSize: 11, padding: '6px 10px', borderRadius: 3, lineHeight: 1.45,
+              background: a.severity === 'warn' ? 'rgba(245,158,11,0.1)' : 'rgba(255,255,255,0.04)',
+              border: `1px solid ${a.severity === 'warn' ? 'rgba(245,158,11,0.35)' : 'rgba(255,255,255,0.1)'}`,
+              color: a.severity === 'warn' ? '#fbbf24' : 'rgba(255,255,255,0.72)',
+            }}>
+              {a.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MeetingsView({
+  challenges, roster, settings, phase, lanes, snapshots, meetings,
+  iccSync, iccRecommendations, onIccSyncNow,
+  onImportSnapshot, onQuickUpdate, onOpenChallenge, onUpdateMeeting, onConfigureRoster,
+}) {
+  const [source, setSource] = useState('metactf');
+  const [paste, setPaste] = useState('');
+  const [importMessage, setImportMessage] = useState('');
+  const [showSolved, setShowSolved] = useState(false);
+  const [manualTitle, setManualTitle] = useState('');
+  const [manualCategory, setManualCategory] = useState('web');
+  const [manualPoints, setManualPoints] = useState('');
+  const [manualSolves, setManualSolves] = useState('');
+  const latestSnapshot = snapshots.find(s => s.source === 'icc') || snapshots[0];
+  const parsedPreview = useMemo(() => parsePlatformImport(paste, source), [paste, source]);
+  const actionableCount = Object.entries(lanes).filter(([k]) => k !== 'solved').reduce((n, [, lane]) => n + lane.items.length, 0);
+  const winCount = lanes.win.items.length;
+  const lockCount = lanes.lock.items.length;
+  const resourceCount = lanes.resource.items.length;
+  const askCount = lanes.ask.items.length;
+
+  const handleImport = async () => {
+    const parsed = parsePlatformImport(paste, source);
+    if (parsed.errors.length || parsed.challenges.length === 0) {
+      setImportMessage(parsed.errors[0] || 'No challenges found in import.');
+      return;
+    }
+    const snapshot = buildPlatformSnapshot({ source, challenges: parsed.challenges, scoreboard: parsed.scoreboard });
+    await onImportSnapshot(snapshot);
+    setPaste('');
+    setImportMessage(`Imported ${snapshot.challengeCount} platform challenge${snapshot.challengeCount === 1 ? '' : 's'}.`);
+  };
+
+  const handleManualRow = async () => {
+    const title = manualTitle.trim();
+    if (!title) return;
+    const challenge = normalizePlatformChallenge({
+      id: title.toLowerCase().replace(/\s+/g, '-'),
+      title,
+      category: manualCategory,
+      points: Number(manualPoints) || 0,
+      solves: Number(manualSolves) || 0,
+      solved: false,
+    }, 'manual');
+    const snapshot = buildPlatformSnapshot({ source: 'manual', challenges: [challenge] });
+    await onImportSnapshot(snapshot);
+    setManualTitle('');
+    setManualPoints('');
+    setManualSolves('');
+    setImportMessage(`Added manual row: ${title}.`);
+  };
+
+  const boardOrder = ['win', 'lock', 'ask', 'resource', 'continue', 'drop'];
+
+  return (
+    <div>
+      <IccLivePanel iccSync={iccSync} liveSnapshot={latestSnapshot} onSyncNow={onIccSyncNow} />
+      <div style={{
+        padding: 16, background: 'linear-gradient(135deg, rgba(212,168,67,0.08), rgba(255,255,255,0.02))',
+        border: '1px solid rgba(212,168,67,0.24)', borderRadius: 4, marginBottom: 16,
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+          <div>
+            <SectionLabel icon={<Target size={11} />}>PRIORITY BOARD</SectionLabel>
+            <div style={{ fontSize: 20, fontWeight: 700, color: '#fff', letterSpacing: '0.04em' }}>
+              What should coaches push, resource, continue, or drop next?
+            </div>
+            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.62)', lineHeight: 1.5, marginTop: 4 }}>
+              Board order is driven by points, phase lock-in risk, public solves, rank impact, and captain-derived confidence.
+            </div>
+          </div>
+          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', textAlign: 'right', lineHeight: 1.5 }}>
+            {latestSnapshot
+              ? <>Latest platform snapshot<br /><b style={{ color: '#d4a843' }}>{latestSnapshot.source}</b> · {fmtRelative(latestSnapshot.importedAt)}</>
+              : <>No platform snapshot yet<br /><b style={{ color: '#d4a843' }}>manual mode</b></>}
+          </div>
+        </div>
+        <div style={{
+          display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10,
+        }}>
+          <StatCard label="ACTIONABLE" value={actionableCount} icon={<Target size={14} />} accent="#d4a843"
+            sub={latestSnapshot ? `${fmtRelative(latestSnapshot.importedAt)}` : 'manual'} />
+          <StatCard label="WIN IMPACT" value={winCount} icon={<Award size={14} />} accent="#d4a843"
+            sub={latestSnapshot?.scoreboard?.gapAbove ? `${latestSnapshot.scoreboard.gapAbove}pt gap` : 'scoreboard'} />
+          <StatCard label="LOCK WATCH" value={lockCount} icon={<Lock size={14} />} accent="#f59e0b"
+            sub={phase.phase === 'locked' ? fmtCountdown(phase.phaseRemaining) : 'phase inactive'} />
+          <StatCard label="RESOURCE CALLS" value={resourceCount} icon={<Users size={14} />} accent="#06b6d4"
+            sub={`${roster.length} active ops`} />
+          <StatCard label="ASK CAPTAINS" value={askCount} icon={<Radio size={14} />} accent="#06b6d4"
+            sub="missing confidence" />
+          <StatCard label="MEETINGS" value={meetings.length} icon={<Clock size={14} />} accent="#94a3b8"
+            sub={meetings[0] ? fmtRelative(meetings[0].createdAt) : 'none yet'} />
+        </div>
+      </div>
+
+      {challenges.length === 0 ? (
+        <MeetingsSetupState
+          manualTitle={manualTitle}
+          setManualTitle={setManualTitle}
+          manualCategory={manualCategory}
+          setManualCategory={setManualCategory}
+          manualPoints={manualPoints}
+          setManualPoints={setManualPoints}
+          manualSolves={manualSolves}
+          setManualSolves={setManualSolves}
+          onManualRow={handleManualRow}
+          onConfigureRoster={onConfigureRoster}
+          settings={settings}
+          roster={roster} />
+      ) : (
+        <>
+          {boardOrder.map(key => (
+            <InsightLane key={key} lane={lanes[key]} onQuickUpdate={onQuickUpdate} onOpenChallenge={onOpenChallenge} onUpdateMeeting={onUpdateMeeting} />
+          ))}
+
+          {lanes.solved.items.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <GhostBtn onClick={() => setShowSolved(s => !s)}>
+                {showSolved ? 'Hide' : 'Show'} solved / verified · {lanes.solved.items.length}
+              </GhostBtn>
+              {showSolved && <InsightLane lane={lanes.solved} onQuickUpdate={onQuickUpdate} onOpenChallenge={onOpenChallenge} onUpdateMeeting={onUpdateMeeting} compact />}
+            </div>
+          )}
+        </>
+      )}
+
+      <div style={{
+        marginTop: 20, display: 'grid', gridTemplateColumns: 'minmax(320px, 1fr) minmax(320px, 1fr)', gap: 14,
+      }}>
+        <div style={{
+          background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.08)',
+          borderRadius: 4, padding: 16,
+        }}>
+          <SectionLabel icon={<FileJson size={11} />}>PLATFORM SNAPSHOT IMPORT</SectionLabel>
+          <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', lineHeight: 1.5, marginBottom: 12 }}>
+            Paste MetaCTF or other platform JSON/CSV. When Swagger/API details are available, the same normalized snapshot shape can be written by `/api/platform/metactf/snapshot`.
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            <Select value={source} onChange={e => setSource(e.target.value)}
+              options={[
+                { value: 'metactf', label: 'MetaCTF' },
+                { value: 'ctfd', label: 'CTFd' },
+                { value: 'manual', label: 'Manual / other' },
+              ]}
+              style={{ minWidth: 150 }} />
+            <GhostBtn onClick={handleImport} disabled={!paste.trim()}>
+              <Download size={12} /> Import
+            </GhostBtn>
+          </div>
+          <textarea value={paste} onChange={e => setPaste(e.target.value)}
+            placeholder={'JSON array/object or CSV with columns like title,category,points,solves,solved. Optional scoreboard: gapAbove,gapBelow,ourRank,ourScore.'}
+            rows={7}
+            style={{
+              background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(255,255,255,0.12)',
+              color: '#fff', padding: '10px 12px', borderRadius: 3, width: '100%',
+              fontFamily: '"JetBrains Mono", monospace', fontSize: 12, outline: 'none', lineHeight: 1.5,
+            }} />
+          <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 11, color: parsedPreview.errors.length ? '#ef4444' : 'rgba(255,255,255,0.45)' }}>
+              {paste.trim()
+                ? parsedPreview.errors[0] || `Preview: ${parsedPreview.challenges.length} normalized challenge${parsedPreview.challenges.length === 1 ? '' : 's'}`
+                : latestSnapshot
+                  ? `Latest: ${latestSnapshot.challengeCount} from ${latestSnapshot.source} · ${fmtRelative(latestSnapshot.importedAt)}`
+                  : 'No platform snapshots imported yet.'}
+            </span>
+            {importMessage && <span style={{ fontSize: 11, color: '#d4a843' }}>{importMessage}</span>}
+          </div>
+        </div>
+
+        <div style={{
+          background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.08)',
+          borderRadius: 4, padding: 16,
+        }}>
+          <SectionLabel icon={<Plus size={11} />}>QUICK MANUAL ROW</SectionLabel>
+          <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)', lineHeight: 1.5, marginBottom: 12 }}>
+            Add a challenge from a captain report when the platform import is not ready.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 90px 90px auto', gap: 8 }}>
+            <Input value={manualTitle} onChange={e => setManualTitle(e.target.value)} placeholder="Challenge title" />
+            <Select value={manualCategory} onChange={e => setManualCategory(e.target.value)}
+              options={Object.entries(CATEGORIES).map(([k, v]) => ({ value: k, label: v.label }))} />
+            <Input type="number" value={manualPoints} onChange={e => setManualPoints(e.target.value)} placeholder="pts" />
+            <Input type="number" value={manualSolves} onChange={e => setManualSolves(e.target.value)} placeholder="solves" />
+            <PrimaryBtn onClick={handleManualRow} disabled={!manualTitle.trim()}><Plus size={12} /> Add</PrimaryBtn>
+          </div>
+        </div>
+      </div>
+
+      {meetings.length > 0 && (
+        <div style={{ marginTop: 22 }}>
+          <SectionLabel icon={<Clock size={11} />}>RECENT MEETING UPDATES</SectionLabel>
+          <div style={{ display: 'grid', gap: 6 }}>
+            {meetings.slice(0, 5).map(m => {
+              const ch = challenges.find(c => c.id === m.challengeId);
+              return (
+                <button key={m.id} onClick={() => ch && onOpenChallenge(ch.id)} style={{
+                  textAlign: 'left', background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.08)',
+                  color: 'rgba(255,255,255,0.75)', padding: '8px 10px', borderRadius: 3, cursor: ch ? 'pointer' : 'default',
+                  fontFamily: '"Chakra Petch", sans-serif', fontSize: 12,
+                }}>
+                  <b style={{ color: '#fff' }}>{ch?.title || 'Unknown challenge'}</b> · {fmtRelative(m.createdAt)} · {COACH_DECISIONS[m.coachDecision]?.label || m.coachDecision}
+                  {m.note ? <span style={{ color: 'rgba(255,255,255,0.5)' }}> · {m.note}</span> : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MeetingsSetupState({ manualTitle, setManualTitle, manualCategory, setManualCategory, manualPoints, setManualPoints, manualSolves, setManualSolves, onManualRow, onConfigureRoster, settings, roster }) {
+  const checklist = [
+    { done: false, label: 'Import platform data or add quick challenge rows.' },
+    { done: roster.length > 0, label: 'Add operator strengths, experience, and fatigue in roster.' },
+    { done: Boolean(settings.startTime), label: 'Set competition start and phase timing.' },
+    { done: false, label: 'Record captain confidence for the top challenges.' },
+  ];
+  return (
+    <div style={{
+      padding: 18, border: '1px dashed rgba(212,168,67,0.25)', borderRadius: 4,
+      background: 'rgba(212,168,67,0.035)', marginBottom: 18,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+        <Radio size={28} color="#d4a843" />
+        <div>
+          <div style={{ fontSize: 15, letterSpacing: '0.18em', color: '#d4a843', fontWeight: 700 }}>
+            SET UP THE PRIORITY BOARD
+          </div>
+          <div style={{ color: 'rgba(255,255,255,0.62)', fontSize: 13, marginTop: 3 }}>
+            Add any challenge data now; the board will start ranking as soon as it has points and solve signals.
+          </div>
+        </div>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.2fr', gap: 14 }}>
+        <div style={{ display: 'grid', gap: 7 }}>
+          {checklist.map(item => (
+            <div key={item.label} style={{
+              display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+              color: item.done ? '#10b981' : 'rgba(255,255,255,0.64)',
+            }}>
+              <span style={{
+                width: 14, height: 14, borderRadius: 2, border: `1px solid ${item.done ? '#10b981' : 'rgba(255,255,255,0.25)'}`,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10,
+              }}>{item.done ? '✓' : ''}</span>
+              {item.label}
+            </div>
+          ))}
+          {roster.length === 0 && (
+            <GhostBtn onClick={onConfigureRoster} style={{ marginTop: 8, width: 'fit-content' }}>
+              <Users size={12} /> Add operator skills
+            </GhostBtn>
+          )}
+        </div>
+        <div>
+          <SectionLabel icon={<Plus size={11} />}>FAST START ROW</SectionLabel>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px 86px 86px auto', gap: 8 }}>
+            <Input value={manualTitle} onChange={e => setManualTitle(e.target.value)} placeholder="Challenge title" />
+            <Select value={manualCategory} onChange={e => setManualCategory(e.target.value)}
+              options={Object.entries(CATEGORIES).map(([k, v]) => ({ value: k, label: v.label }))} />
+            <Input type="number" value={manualPoints} onChange={e => setManualPoints(e.target.value)} placeholder="pts" />
+            <Input type="number" value={manualSolves} onChange={e => setManualSolves(e.target.value)} placeholder="solves" />
+            <PrimaryBtn onClick={onManualRow} disabled={!manualTitle.trim()}><Plus size={12} /> Add</PrimaryBtn>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InsightLane({ lane, onQuickUpdate, onOpenChallenge, onUpdateMeeting, compact = false }) {
+  if (!lane.items.length) return null;
+  return (
+    <div style={{ marginBottom: compact ? 10 : 18 }}>
+      <SectionLabel icon={<ChevronRight size={11} />}>{lane.label} · {lane.items.length}</SectionLabel>
+      <div style={{ display: 'grid', gridTemplateColumns: compact ? '1fr' : 'repeat(auto-fill, minmax(360px, 1fr))', gap: 10 }}>
+        {lane.items.map(insight => (
+          <InsightCard key={insight.challenge.id} insight={insight} color={lane.color}
+            onQuickUpdate={onQuickUpdate} onOpenChallenge={onOpenChallenge} onUpdateMeeting={onUpdateMeeting} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InsightCard({ insight, color, onQuickUpdate, onOpenChallenge, onUpdateMeeting }) {
+  const c = insight.challenge;
+  const cat = CATEGORIES[c.category] || CATEGORIES.misc;
+  const decision = COACH_DECISIONS[c.coachDecision] || COACH_DECISIONS.watch;
+  const need = RESOURCE_NEEDS[c.resourceNeed] || RESOURCE_NEEDS.none;
+  const confidence = CAPTAIN_CONFIDENCE[c.captainConfidence] || CAPTAIN_CONFIDENCE.unknown;
+  const phaseConfidence = PHASE_SOLVE_CONFIDENCE[c.phaseSolveConfidence] || PHASE_SOLVE_CONFIDENCE.unknown;
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.025)', border: `1px solid ${color}45`,
+      borderLeft: `3px solid ${color}`, borderRadius: 4, padding: 13,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 5 }}>
+            <Badge color={cat.color}>{cat.label}</Badge>
+            <Badge color={decision.color}>{decision.label}</Badge>
+            <Badge color={confidence.color}>{confidence.label}</Badge>
+            <Badge color={phaseConfidence.color}>{phaseConfidence.label}</Badge>
+            {c.resourceNeed !== 'none' && <Badge color={need.color}>{need.label}</Badge>}
+            {insight.iccRec && ICC_RECOMMENDATIONS[insight.iccRec.key] && (
+              <Badge color={ICC_RECOMMENDATIONS[insight.iccRec.key].color} title={insight.iccRec.reasons?.join(' · ')}>
+                {ICC_RECOMMENDATIONS[insight.iccRec.key].label}
+              </Badge>
+            )}
+          </div>
+          <div style={{ color: '#fff', fontWeight: 700, fontSize: 15 }}>{c.title || 'Untitled'}</div>
+        </div>
+        <div style={{ textAlign: 'right', flexShrink: 0 }}>
+          <div style={{ fontFamily: '"JetBrains Mono", monospace', color, fontWeight: 700, fontSize: 18 }}>{insight.score}</div>
+          <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.45)', letterSpacing: '0.12em' }}>PRIORITY</div>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 10 }}>
+        <Stat label="POINTS" value={insight.currentPoints || '-'} accent="#d4a843" />
+        <Stat label="SOLVES" value={c.platformSolveCount ?? '-'} accent="#06b6d4" />
+        <Stat label="RANK IMPACT" value={insight.rankImpact || '-'} accent="#d4a843" />
+        <Stat label="PHASE RISK" value={insight.phaseRisk || '-'} accent="#ef4444" />
+        <Stat label="TIME" value={insight.timeSpent ? `${insight.timeSpent}m` : '-'} accent="#f59e0b" />
+      </div>
+
+      {insight.reasons.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
+          {insight.reasons.slice(0, 5).map(reason => (
+            <span key={reason} style={{
+              fontSize: 10, padding: '2px 6px', background: 'rgba(255,255,255,0.04)',
+              border: '1px solid rgba(255,255,255,0.08)', color: 'rgba(255,255,255,0.62)', borderRadius: 2,
+            }}>{reason}</span>
+          ))}
+        </div>
+      )}
+
+      <div style={{
+        padding: '8px 10px', background: 'rgba(0,0,0,0.22)', border: '1px dashed rgba(255,255,255,0.1)',
+        borderRadius: 3, fontSize: 11, color: 'rgba(255,255,255,0.65)', lineHeight: 1.45, marginBottom: 10,
+      }}>
+        <b style={{ color }}>Captain question:</b> {insight.questionPrompts[0]}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 10 }}>
+        <Select value={c.captainConfidence || 'unknown'}
+          onChange={e => onQuickUpdate(c.id, { captainConfidence: e.target.value, lastMeetingAt: Date.now() })}
+          options={Object.entries(CAPTAIN_CONFIDENCE).map(([k, v]) => ({ value: k, label: v.label }))}
+          style={{ width: '100%', fontSize: 11 }} />
+        <Select value={c.phaseSolveConfidence || 'unknown'}
+          onChange={e => onQuickUpdate(c.id, { phaseSolveConfidence: e.target.value, lastMeetingAt: Date.now() })}
+          options={Object.entries(PHASE_SOLVE_CONFIDENCE).map(([k, v]) => ({ value: k, label: v.label }))}
+          style={{ width: '100%', fontSize: 11 }} />
+        <Select value={c.coachDecision || 'watch'}
+          onChange={e => onQuickUpdate(c.id, { coachDecision: e.target.value })}
+          options={Object.entries(COACH_DECISIONS).map(([k, v]) => ({ value: k, label: v.label }))}
+          style={{ width: '100%', fontSize: 11 }} />
+        <Select value={c.resourceNeed || 'none'}
+          onChange={e => onQuickUpdate(c.id, { resourceNeed: e.target.value })}
+          options={Object.entries(RESOURCE_NEEDS).map(([k, v]) => ({ value: k, label: v.label }))}
+          style={{ width: '100%', fontSize: 11 }} />
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <GhostBtn onClick={() => onOpenChallenge(c.id)}>
+          <ExternalLink size={12} /> Open
+        </GhostBtn>
+        <PrimaryBtn onClick={() => onUpdateMeeting(c.id)}>
+          <Radio size={12} /> Meeting Update
+        </PrimaryBtn>
+      </div>
+    </div>
+  );
+}
+
+function MeetingUpdateModal({ challenge, roster, onClose, onSave }) {
+  const [progress, setProgress] = useState(challenge.captainProgress ?? '');
+  const [timeSpent, setTimeSpent] = useState(challenge.captainTimeSpentMinutes ?? '');
+  const [captainConfidence, setCaptainConfidence] = useState(challenge.captainConfidence || 'unknown');
+  const [phaseSolveConfidence, setPhaseSolveConfidence] = useState(challenge.phaseSolveConfidence || 'unknown');
+  const [resourceNeed, setResourceNeed] = useState(challenge.resourceNeed || 'none');
+  const [coachDecision, setCoachDecision] = useState(challenge.coachDecision || 'watch');
+  const [resourceAskCategory, setResourceAskCategory] = useState(challenge.resourceAskCategory || '');
+  const [resourceAskName, setResourceAskName] = useState(challenge.resourceAskName || '');
+  const [assignees, setAssignees] = useState(challenge.assignees || []);
+  const [note, setNote] = useState('');
+  const toggle = (name) => setAssignees(prev => prev.includes(name) ? prev.filter(x => x !== name) : [...prev, name]);
+  const handleSave = () => onSave({
+    captainProgress: progress === '' ? null : Math.max(0, Math.min(100, Number(progress) || 0)),
+    captainTimeSpentMinutes: timeSpent === '' ? null : Math.max(0, Number(timeSpent) || 0),
+    captainConfidence,
+    phaseSolveConfidence,
+    resourceNeed,
+    coachDecision,
+    resourceAskCategory,
+    resourceAskName: resourceAskName.trim(),
+    assignees,
+    note: note.trim(),
+  });
+
+  return (
+    <Modal onClose={onClose} width={720}>
+      <div style={{ padding: '18px 22px', borderBottom: '1px solid rgba(255,255,255,0.08)', display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 10, letterSpacing: '0.25em', color: '#d4a843', fontWeight: 600 }}>◆ CAPTAIN MEETING UPDATE</div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: '#fff', marginTop: 4 }}>{challenge.title || 'Untitled'}</div>
+        </div>
+        <IconBtn onClick={onClose}><X size={14} /></IconBtn>
+      </div>
+      <div style={{ padding: 22 }}>
+        {roster.length > 0 && (
+          <div style={{ marginBottom: 18 }}>
+            <SectionLabel icon={<Users size={11} />}>REPORTED OPERATORS</SectionLabel>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {roster.map(p => {
+                const on = assignees.includes(p.name);
+                const exp = EXPERIENCE_LEVELS[p.experienceLevel] || EXPERIENCE_LEVELS.solid;
+                const availability = AVAILABILITY_STATUSES[p.availabilityStatus] || AVAILABILITY_STATUSES.available;
+                return (
+                  <button key={p.name} onClick={() => toggle(p.name)} title={`${exp.label} · ${availability.label}`} style={{
+                    background: on ? 'rgba(212,168,67,0.15)' : 'rgba(255,255,255,0.03)',
+                    border: `1px solid ${on ? '#d4a843' : 'rgba(255,255,255,0.1)'}`,
+                    color: on ? '#d4a843' : 'rgba(255,255,255,0.7)',
+                    padding: '6px 10px', borderRadius: 3, cursor: 'pointer',
+                    fontFamily: '"Chakra Petch", sans-serif', fontSize: 12,
+                  }}>
+                    {p.name}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 18 }}>
+          <div>
+            <SectionLabel icon={<Activity size={11} />}>PROGRESS CONFIDENCE (%)</SectionLabel>
+            <Input type="number" min="0" max="100" value={progress} onChange={e => setProgress(e.target.value)} placeholder="0-100" />
+          </div>
+          <div>
+            <SectionLabel icon={<Clock size={11} />}>TIME SPENT (MIN)</SectionLabel>
+            <Input type="number" min="0" value={timeSpent} onChange={e => setTimeSpent(e.target.value)} placeholder="minutes" />
+          </div>
+          <div>
+            <SectionLabel icon={<Radio size={11} />}>CAPTAIN CONFIDENCE</SectionLabel>
+            <Select value={captainConfidence} onChange={e => setCaptainConfidence(e.target.value)}
+              options={Object.entries(CAPTAIN_CONFIDENCE).map(([k, v]) => ({ value: k, label: v.label }))} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <SectionLabel icon={<Lock size={11} />}>SOLVE BEFORE PHASE?</SectionLabel>
+            <Select value={phaseSolveConfidence} onChange={e => setPhaseSolveConfidence(e.target.value)}
+              options={Object.entries(PHASE_SOLVE_CONFIDENCE).map(([k, v]) => ({ value: k, label: v.label }))} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <SectionLabel icon={<AlertTriangle size={11} />}>RESOURCE NEED</SectionLabel>
+            <Select value={resourceNeed} onChange={e => setResourceNeed(e.target.value)}
+              options={Object.entries(RESOURCE_NEEDS).map(([k, v]) => ({ value: k, label: v.label }))} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <SectionLabel icon={<Target size={11} />}>COACH DECISION</SectionLabel>
+            <Select value={coachDecision} onChange={e => setCoachDecision(e.target.value)}
+              options={Object.entries(COACH_DECISIONS).map(([k, v]) => ({ value: k, label: v.label }))} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <SectionLabel icon={<Tag size={11} />}>RESOURCE CATEGORY</SectionLabel>
+            <Select value={resourceAskCategory} onChange={e => setResourceAskCategory(e.target.value)}
+              options={[{ value: '', label: 'No category ask' }, ...Object.entries(CATEGORIES).map(([k, v]) => ({ value: k, label: v.label }))]} style={{ width: '100%' }} />
+          </div>
+          <div>
+            <SectionLabel icon={<UserCheck size={11} />}>RESOURCE / OPERATOR ASK</SectionLabel>
+            <Input value={resourceAskName} onChange={e => setResourceAskName(e.target.value)} placeholder="optional named resource" />
+          </div>
+        </div>
+
+        <SectionLabel icon={<Terminal size={11} />}>NON-TECHNICAL MEETING NOTE</SectionLabel>
+        <textarea value={note} onChange={e => setNote(e.target.value)}
+          placeholder="Resource, morale, staffing, or priority notes only. Avoid technical hints/answers."
+          rows={4}
+          style={{
+            background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(255,255,255,0.12)',
+            color: '#fff', padding: '10px 12px', borderRadius: 3, width: '100%',
+            fontFamily: '"JetBrains Mono", monospace', fontSize: 13, outline: 'none', lineHeight: 1.5,
+            marginBottom: 18,
+          }} />
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <GhostBtn onClick={onClose}>Cancel</GhostBtn>
+          <PrimaryBtn onClick={handleSave}><Check size={13} strokeWidth={3} /> Save Meeting Update</PrimaryBtn>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -1416,7 +2601,7 @@ function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChalle
                           </span>
                         </span>
                         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          {sp === 'human-resistance' && (
+                          {sp === 'locked' && (
                             <span style={{ fontSize: 9, color: '#10b981', letterSpacing: '0.1em' }}>
                               <Lock size={9} style={{ verticalAlign: -1 }} /> LOCKED
                             </span>
@@ -1540,7 +2725,6 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
 
   const cat = CATEGORIES[draft.category] || CATEGORIES.misc;
   const sp = solvedPhase(draft, settings);
-  const isJeopardy = settings.competitionDay === 'jeopardy';
 
   return (
     <Modal onClose={onClose} width={760}>
@@ -1553,11 +2737,11 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <Badge color={cat.color}>{cat.label}</Badge>
           <DifficultyDots level={draft.difficulty} />
-          {sp === 'human-resistance' && (
-            <Badge color="#10b981"><Lock size={10} /> {isJeopardy ? 'SCORE LOCKED · HR' : 'SOLVED IN HR'}</Badge>
+          {sp === 'locked' && (
+            <Badge color="#10b981"><Lock size={10} /> SCORE LOCKED · {(settings.lockedPhaseLabel || 'Phase 1').toUpperCase()}</Badge>
           )}
-          {sp === 'robot-uprising' && (
-            <Badge color="#ef4444"><Cpu size={10} /> SOLVED IN RU</Badge>
+          {sp === 'open' && (
+            <Badge color="#ef4444"><Cpu size={10} /> SOLVED IN {(settings.openPhaseLabel || 'Phase 2').toUpperCase()}</Badge>
           )}
           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontFamily: '"JetBrains Mono", monospace' }}>
             #{draft.id.slice(-6)}
@@ -1577,7 +2761,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           placeholder="Challenge name…"
           style={{ fontSize: 20, fontWeight: 600, padding: '10px 14px', marginBottom: 18 }} />
 
-        {isJeopardy && draft.status !== 'solved' && phase.phase === 'human-resistance' && phase.phaseRemaining < LOCK_WARN_MS && (
+        {draft.status !== 'solved' && (settings.useLockedPhase ?? false) && phase.phase === 'locked' && phase.phaseRemaining < LOCK_WARN_MS && (
           <div style={{
             marginBottom: 18, padding: 12,
             background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)',
@@ -1585,7 +2769,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           }}>
             <AlertTriangle size={18} color="#ef4444" />
             <div style={{ flex: 1, fontSize: 12, color: '#fca5a5' }}>
-              <b>LOCK-IN PRIORITY:</b> Robot Uprising starts in <b style={{ fontFamily: '"JetBrains Mono", monospace' }}>{fmtCountdown(phase.phaseRemaining)}</b>. Score will continue decaying if not solved before then.
+              <b>LOCK-IN PRIORITY:</b> {settings.openPhaseLabel || 'Phase 2'} starts in <b style={{ fontFamily: '"JetBrains Mono", monospace' }}>{fmtCountdown(phase.phaseRemaining)}</b>. Score will continue decaying if not solved before then.
             </div>
           </div>
         )}
@@ -1648,7 +2832,15 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           </div>
           <div>
             <SectionLabel icon={<Activity size={11} />}>STATUS</SectionLabel>
-            <Select value={draft.status} onChange={e => update({ status: e.target.value })}
+            <Select value={draft.status} onChange={e => {
+              const status = e.target.value;
+              const now = Date.now();
+              update({
+                status,
+                solvedAt: status === 'solved' ? (draft.solvedAt || now) : null,
+                solvedBy: status === 'solved' ? (draft.solvedBy?.length ? draft.solvedBy : draft.assignees) : [],
+              });
+            }}
               options={Object.entries(STATUSES).map(([k, v]) => ({ value: k, label: v.label }))}
               style={{ width: '100%' }} />
           </div>
@@ -1659,6 +2851,27 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
               placeholder="optional" />
           </div>
         </div>
+
+        {(draft.platformId || draft.platformPoints != null || draft.lastMeetingAt) && (
+          <div style={{
+            marginBottom: 18, padding: 12, background: 'rgba(212,168,67,0.04)',
+            border: '1px solid rgba(212,168,67,0.18)', borderRadius: 4,
+          }}>
+            <SectionLabel icon={<Radio size={11} />}>COACHING INSIGHT DATA</SectionLabel>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 10 }}>
+              <Stat label="PLATFORM PTS" value={draft.platformPoints ?? '-'} accent="#d4a843" />
+              <Stat label="PUBLIC SOLVES" value={draft.platformSolveCount ?? '-'} accent="#06b6d4" />
+              <Stat label="PROGRESS" value={draft.captainProgress != null ? `${draft.captainProgress}%` : '-'} accent="#10b981" />
+              <Stat label="TIME SPENT" value={draft.captainTimeSpentMinutes != null ? `${draft.captainTimeSpentMinutes}m` : '-'} accent="#f59e0b" />
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {draft.platformSource && <Badge color="#94a3b8">{draft.platformSource}</Badge>}
+              {draft.resourceNeed && draft.resourceNeed !== 'none' && <Badge color={RESOURCE_NEEDS[draft.resourceNeed]?.color || '#94a3b8'}>{RESOURCE_NEEDS[draft.resourceNeed]?.label || draft.resourceNeed}</Badge>}
+              {draft.coachDecision && <Badge color={COACH_DECISIONS[draft.coachDecision]?.color || '#94a3b8'}>{COACH_DECISIONS[draft.coachDecision]?.label || draft.coachDecision}</Badge>}
+              {draft.lastMeetingAt && <Badge color="#d4a843">MEETING {fmtRelative(draft.lastMeetingAt)}</Badge>}
+            </div>
+          </div>
+        )}
 
         <div style={{ marginBottom: 18 }}>
           <SectionLabel icon={<ExternalLink size={11} />}>CHALLENGE URL</SectionLabel>
@@ -1849,9 +3062,9 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
     engaged: challenges.filter(c => c.status === 'in-progress').length,
     stuck: challenges.filter(c => c.status === 'stuck').length,
     points: challenges.filter(c => c.status === 'solved').reduce((s, c) => s + (c.points || 0), 0),
-    solvedHR: challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').length,
-    solvedRU: challenges.filter(c => solvedPhase(c, settings) === 'robot-uprising').length,
-    pointsHR: challenges.filter(c => solvedPhase(c, settings) === 'human-resistance').reduce((s, c) => s + (c.points || 0), 0),
+    solvedHR: challenges.filter(c => solvedPhase(c, settings) === 'locked').length,
+    solvedRU: challenges.filter(c => solvedPhase(c, settings) === 'open').length,
+    pointsHR: challenges.filter(c => solvedPhase(c, settings) === 'locked').reduce((s, c) => s + (c.points || 0), 0),
   };
 
   const byCat = Object.entries(CATEGORIES).map(([k, v]) => ({
@@ -1867,11 +3080,14 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
     return { name: p.name, status: p.status, assigned: assigned.length, engaged, solved };
   });
 
+  const lockedLabel = settings.lockedPhaseLabel || 'Phase 1';
+  const openLabel = settings.openPhaseLabel || 'Phase 2';
   const phaseDesc = phase.phase === 'pending' ? 'Not started'
     : phase.phase === 'scheduled' ? `Scheduled to start ${new Date(settings.startTime).toLocaleString()}`
     : phase.phase === 'ended' ? 'Concluded'
-    : phase.phase === 'human-resistance' ? `Human Resistance · ${fmtCountdown(phase.phaseRemaining)} until score lock`
-    : `Robot Uprising · ${fmtCountdown(phase.phaseRemaining)} remaining`;
+    : phase.phase === 'locked' ? `${lockedLabel} · ${fmtCountdown(phase.phaseRemaining)} until score lock`
+    : phase.phase === 'open' ? `${openLabel} · ${fmtCountdown(phase.phaseRemaining)} remaining`
+    : `In Progress · ${fmtCountdown(phase.phaseRemaining)} remaining`;
 
   const sortedChallenges = [...challenges].sort((a, b) => {
     const order = { 'in-progress': 0, stuck: 1, unsolved: 2, solved: 3 };
@@ -1881,7 +3097,7 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
   const challengeRows = sortedChallenges.map(c => {
     const cat = CATEGORIES[c.category] || CATEGORIES.misc;
     const sp = solvedPhase(c, settings);
-    const phaseTag = sp === 'human-resistance' ? '🔒 HR' : sp === 'robot-uprising' ? 'RU' : '';
+    const phaseTag = sp === 'locked' ? `🔒 ${lockedLabel}` : sp === 'open' ? openLabel : '';
     return `
       <tr class="status-${c.status}">
         <td><span class="cat" style="background:${cat.color}22;color:${cat.color};border-color:${cat.color}">${escapeHTML(cat.label)}</span></td>
@@ -1974,6 +3190,8 @@ function exportJSON(data) {
     settings: data.settings,
     roster: data.roster,
     challenges: data.challenges,
+    platformSnapshots: data.platformSnapshots || [],
+    meetings: data.meetings || [],
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -1990,7 +3208,7 @@ function exportJSON(data) {
 // ROSTER & SETTINGS MODAL
 // ============================================================
 
-function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onSaveRoster, onSaveSettings, onClearAll }) {
+function RosterModal({ roster, settings, challenges, platformSnapshots = [], meetings = [], subsRemaining, onClose, onSaveRoster, onSaveSettings, onClearAll }) {
   const [newName, setNewName] = useState('');
   const [eventName, setEventName] = useState(settings.eventName || '');
   const [tab, setTab] = useState('competition');
@@ -1998,7 +3216,7 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
   const add = () => {
     const n = newName.trim();
     if (!n || roster.some(p => p.name === n)) return;
-    onSaveRoster([...roster, { name: n, status: 'active', subbedOutAt: null }]);
+    onSaveRoster([...roster, { name: n, status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '' }]);
     setNewName('');
   };
 
@@ -2017,6 +3235,10 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
 
   const reinstate = (name) => {
     onSaveRoster(roster.map(p => p.name === name ? { ...p, status: 'active', subbedOutAt: null } : p));
+  };
+
+  const updateOperator = (name, patch) => {
+    onSaveRoster(roster.map(p => p.name === name ? { ...p, ...patch } : p));
   };
 
   const opStats = useMemo(() => roster.map(p => {
@@ -2070,24 +3292,17 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
               <GhostBtn onClick={() => onSaveSettings({ ...settings, eventName: eventName.trim() || 'COACH COMMAND CENTER' })}>Save</GhostBtn>
             </div>
 
-            <SectionLabel icon={<Target size={11} />}>COMPETITION DAY</SectionLabel>
-            <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
-              {Object.entries(COMP_DAYS).map(([k, d]) => {
-                const on = settings.competitionDay === k;
-                return (
-                  <button key={k} onClick={() => onSaveSettings({ ...settings, competitionDay: k })} style={{
-                    flex: 1, background: on ? `${d.color}15` : 'rgba(255,255,255,0.02)',
-                    border: `1px solid ${on ? d.color : 'rgba(255,255,255,0.1)'}`,
-                    color: on ? d.color : 'rgba(255,255,255,0.6)',
-                    padding: '12px', borderRadius: 4, cursor: 'pointer',
-                    fontFamily: '"Chakra Petch", sans-serif', fontSize: 13, fontWeight: 600,
-                    letterSpacing: '0.1em', textTransform: 'uppercase',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-                  }}>
-                    <span style={{ fontSize: 18 }}>{d.icon}</span> {d.label}
-                  </button>
-                );
-              })}
+            <SectionLabel icon={<Target size={11} />}>COMPETITION TYPE</SectionLabel>
+            <div style={{ marginBottom: 18 }}>
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+                padding: '10px 16px', background: 'rgba(212,168,67,0.1)',
+                border: '1px solid rgba(212,168,67,0.4)', borderRadius: 4,
+                color: '#d4a843', fontFamily: '"Chakra Petch", sans-serif',
+                fontSize: 13, fontWeight: 600, letterSpacing: '0.1em',
+              }}>
+                <span style={{ fontSize: 16 }}>◆</span> JEOPARDY
+              </span>
             </div>
 
             <SectionLabel icon={<Clock size={11} />}>START TIME</SectionLabel>
@@ -2105,27 +3320,70 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
               </GhostBtn>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 18 }}>
-              <div>
-                <SectionLabel icon={<ShieldAlert size={11} />}>HUMAN RESISTANCE HOURS</SectionLabel>
-                <Input type="number" min="0" max="24" step="0.5"
-                  value={settings.hrHours ?? DEFAULT_HR_HOURS}
-                  onChange={e => onSaveSettings({ ...settings, hrHours: parseFloat(e.target.value) || 0 })} />
-              </div>
-              <div>
-                <SectionLabel icon={<Cpu size={11} />}>ROBOT UPRISING HOURS</SectionLabel>
-                <Input type="number" min="0" max="24" step="0.5"
-                  value={settings.ruHours ?? DEFAULT_RU_HOURS}
-                  onChange={e => onSaveSettings({ ...settings, ruHours: parseFloat(e.target.value) || 0 })} />
-              </div>
+            <SectionLabel icon={<Clock size={11} />}>TOTAL DURATION (HOURS)</SectionLabel>
+            <div style={{ marginBottom: 18 }}>
+              <Input type="number" min="0" max="48" step="0.5"
+                value={settings.durationHours ?? DEFAULT_DURATION_HOURS}
+                onChange={e => onSaveSettings({ ...settings, durationHours: parseFloat(e.target.value) || 0 })} />
             </div>
+
+            <SectionLabel icon={<Lock size={11} />}>LOCKED PHASE</SectionLabel>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: 'rgba(255,255,255,0.8)' }}>
+                <input type="checkbox"
+                  checked={settings.useLockedPhase ?? false}
+                  onChange={e => onSaveSettings({ ...settings, useLockedPhase: e.target.checked })}
+                  style={{ width: 14, height: 14, cursor: 'pointer', accentColor: '#d4a843' }} />
+                Enable locked phase (score freeze at phase boundary)
+              </label>
+            </div>
+
+            {(settings.useLockedPhase ?? false) && (
+              <div style={{ marginBottom: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 12 }}>
+                  <div>
+                    <SectionLabel icon={<ShieldAlert size={11} />}>LOCKED PHASE HOURS</SectionLabel>
+                    <Input type="number" min="0" max="48" step="0.5"
+                      value={settings.lockedPhaseHours ?? DEFAULT_HR_HOURS}
+                      onChange={e => onSaveSettings({ ...settings, lockedPhaseHours: parseFloat(e.target.value) || 0 })} />
+                  </div>
+                  <div />
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 12 }}>
+                  <div>
+                    <SectionLabel icon={<ShieldAlert size={11} />}>LOCKED PHASE LABEL</SectionLabel>
+                    <Input value={settings.lockedPhaseLabel || ''}
+                      placeholder="e.g. Human Resistance"
+                      onChange={e => onSaveSettings({ ...settings, lockedPhaseLabel: e.target.value })} />
+                  </div>
+                  <div>
+                    <SectionLabel icon={<Cpu size={11} />}>OPEN PHASE LABEL</SectionLabel>
+                    <Input value={settings.openPhaseLabel || ''}
+                      placeholder="e.g. Robot Uprising"
+                      onChange={e => onSaveSettings({ ...settings, openPhaseLabel: e.target.value })} />
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div style={{
               padding: 12, background: 'rgba(212,168,67,0.05)', border: '1px solid rgba(212,168,67,0.2)',
-              borderRadius: 3, fontSize: 12, color: 'rgba(255,255,255,0.7)', lineHeight: 1.5,
+              borderRadius: 3, fontSize: 12, color: 'rgba(255,255,255,0.7)', lineHeight: 1.5, marginBottom: 10,
             }}>
               <b style={{ color: '#d4a843' }}>ICC 2026 default:</b> 9-hour competition = 7h Human Resistance (simple AI only) + 2h Robot Uprising (approved AI permitted).
               On Jeopardy day, challenges solved during HR have their score locked at end-of-HR value.
+            </div>
+            <div style={{ marginBottom: 18 }}>
+              <GhostBtn onClick={() => onSaveSettings({
+                ...settings,
+                durationHours: 9,
+                useLockedPhase: true,
+                lockedPhaseHours: 7,
+                lockedPhaseLabel: 'Human Resistance',
+                openPhaseLabel: 'Robot Uprising',
+              })}>
+                <Zap size={12} /> ICC 2026 Preset
+              </GhostBtn>
             </div>
 
             <div style={{
@@ -2178,51 +3436,74 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
                   <div>OPERATOR</div><div>STATUS</div><div>ASSIGNED</div><div>ENGAGED</div><div>SOLVED</div><div></div>
                 </div>
                 {opStats.map(op => (
-                  <div key={op.name} style={{
-                    display: 'grid', gridTemplateColumns: '1.6fr 0.8fr 0.7fr 0.7fr 0.7fr 110px',
-                    padding: '10px 12px', borderTop: '1px solid rgba(255,255,255,0.05)',
-                    fontSize: 13, alignItems: 'center', gap: 8,
-                    opacity: op.status === 'subbed-out' ? 0.5 : 1,
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <Avatar name={op.name} index={0} size={22} />
-                      <span style={{ fontWeight: 500, textDecoration: op.status === 'subbed-out' ? 'line-through' : 'none' }}>{op.name}</span>
-                    </div>
-                    <div>
-                      {op.status === 'subbed-out' ? (
-                        <span style={{ fontSize: 9, color: '#ef4444', letterSpacing: '0.1em', fontWeight: 600 }}>SUBBED OUT</span>
-                      ) : (
-                        <span style={{ fontSize: 9, color: '#10b981', letterSpacing: '0.1em', fontWeight: 600 }}>ACTIVE</span>
-                      )}
-                    </div>
-                    <div style={{ fontFamily: '"JetBrains Mono", monospace' }}>{op.assigned}</div>
-                    <div style={{ fontFamily: '"JetBrains Mono", monospace', color: '#f59e0b' }}>{op.engaged}</div>
-                    <div style={{ fontFamily: '"JetBrains Mono", monospace', color: '#10b981' }}>{op.solved}</div>
-                    <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
-                      {op.status === 'active' ? (
-                        <button onClick={() => subOut(op.name)} disabled={subsRemaining <= 0}
-                          title={subsRemaining > 0 ? 'Substitute out' : 'No substitutions remaining'}
-                          style={{
-                            background: 'rgba(245,158,11,0.1)',
-                            border: '1px solid rgba(245,158,11,0.3)',
-                            color: subsRemaining > 0 ? '#f59e0b' : 'rgba(255,255,255,0.2)',
-                            padding: '3px 8px', borderRadius: 2,
-                            cursor: subsRemaining > 0 ? 'pointer' : 'not-allowed',
+                  <div key={op.name} style={{ borderTop: '1px solid rgba(255,255,255,0.05)', opacity: op.status === 'subbed-out' ? 0.5 : 1 }}>
+                    <div style={{
+                      display: 'grid', gridTemplateColumns: '1.6fr 0.8fr 0.7fr 0.7fr 0.7fr 110px',
+                      padding: '10px 12px 6px', fontSize: 13, alignItems: 'center', gap: 8,
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <Avatar name={op.name} index={0} size={22} />
+                        <span style={{ fontWeight: 500, textDecoration: op.status === 'subbed-out' ? 'line-through' : 'none' }}>{op.name}</span>
+                      </div>
+                      <div>
+                        {op.status === 'subbed-out' ? (
+                          <span style={{ fontSize: 9, color: '#ef4444', letterSpacing: '0.1em', fontWeight: 600 }}>SUBBED OUT</span>
+                        ) : (
+                          <span style={{ fontSize: 9, color: '#10b981', letterSpacing: '0.1em', fontWeight: 600 }}>ACTIVE</span>
+                        )}
+                      </div>
+                      <div style={{ fontFamily: '"JetBrains Mono", monospace' }}>{op.assigned}</div>
+                      <div style={{ fontFamily: '"JetBrains Mono", monospace', color: '#f59e0b' }}>{op.engaged}</div>
+                      <div style={{ fontFamily: '"JetBrains Mono", monospace', color: '#10b981' }}>{op.solved}</div>
+                      <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                        {op.status === 'active' ? (
+                          <button onClick={() => subOut(op.name)} disabled={subsRemaining <= 0}
+                            title={subsRemaining > 0 ? 'Substitute out' : 'No substitutions remaining'}
+                            style={{
+                              background: 'rgba(245,158,11,0.1)',
+                              border: '1px solid rgba(245,158,11,0.3)',
+                              color: subsRemaining > 0 ? '#f59e0b' : 'rgba(255,255,255,0.2)',
+                              padding: '3px 8px', borderRadius: 2,
+                              cursor: subsRemaining > 0 ? 'pointer' : 'not-allowed',
+                              fontSize: 10, letterSpacing: '0.1em',
+                            }}>
+                            <ArrowLeftRight size={10} style={{ verticalAlign: -1 }} /> SUB
+                          </button>
+                        ) : (
+                          <button onClick={() => reinstate(op.name)} style={{
+                            background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)',
+                            color: '#10b981', padding: '3px 8px', borderRadius: 2, cursor: 'pointer',
                             fontSize: 10, letterSpacing: '0.1em',
-                          }}>
-                          <ArrowLeftRight size={10} style={{ verticalAlign: -1 }} /> SUB
-                        </button>
-                      ) : (
-                        <button onClick={() => reinstate(op.name)} style={{
-                          background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)',
-                          color: '#10b981', padding: '3px 8px', borderRadius: 2, cursor: 'pointer',
-                          fontSize: 10, letterSpacing: '0.1em',
-                        }}>REINSTATE</button>
-                      )}
-                      <button onClick={() => remove(op.name)} style={{
-                        background: 'none', border: 'none', color: 'rgba(239,68,68,0.6)', cursor: 'pointer',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 4px',
-                      }} title="Remove from roster"><Trash2 size={13} /></button>
+                          }}>REINSTATE</button>
+                        )}
+                        <button onClick={() => remove(op.name)} style={{
+                          background: 'none', border: 'none', color: 'rgba(239,68,68,0.6)', cursor: 'pointer',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 4px',
+                        }} title="Remove from roster"><Trash2 size={13} /></button>
+                      </div>
+                    </div>
+                    <div style={{
+                      display: 'grid', gridTemplateColumns: '1.2fr 1fr 1fr', gap: 8,
+                      padding: '0 12px 10px', alignItems: 'center',
+                    }}>
+                      <Select value={op.experienceLevel || 'solid'}
+                        onChange={e => updateOperator(op.name, { experienceLevel: e.target.value })}
+                        options={Object.entries(EXPERIENCE_LEVELS).map(([k, v]) => ({ value: k, label: v.label }))}
+                        style={{ width: '100%', fontSize: 11 }} />
+                      <Select value={op.availabilityStatus || 'available'}
+                        onChange={e => updateOperator(op.name, { availabilityStatus: e.target.value })}
+                        options={Object.entries(AVAILABILITY_STATUSES).map(([k, v]) => ({ value: k, label: v.label }))}
+                        style={{ width: '100%', fontSize: 11 }} />
+                      <Input value={(op.strengths || []).join(', ')}
+                        onChange={e => updateOperator(op.name, {
+                          strengths: e.target.value.split(',').map(x => x.trim().toLowerCase()).filter(x => CATEGORIES[x]),
+                        })}
+                        placeholder="strengths: web, crypto" style={{ fontSize: 11 }} />
+                    </div>
+                    <div style={{ padding: '0 12px 10px' }}>
+                      <Input value={op.fatigueNote || ''}
+                        onChange={e => updateOperator(op.name, { fatigueNote: e.target.value })}
+                        placeholder="fatigue / availability note" style={{ fontSize: 11 }} />
                     </div>
                   </div>
                 ))}
@@ -2238,7 +3519,7 @@ function RosterModal({ roster, settings, challenges, subsRemaining, onClose, onS
               Download the current state of the tracker as a snapshot. JSON for backup or post-event analysis; PDF for sharing with captains, jury, or post-competition retros.
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 22 }}>
-              <button onClick={() => exportJSON({ challenges, roster, settings })} style={{
+              <button onClick={() => exportJSON({ challenges, roster, settings, platformSnapshots, meetings })} style={{
                 padding: 16, background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.12)',
                 borderRadius: 4, cursor: 'pointer', color: '#fff', textAlign: 'left',
                 fontFamily: '"Chakra Petch", sans-serif', display: 'flex', flexDirection: 'column', gap: 6,

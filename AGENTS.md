@@ -57,9 +57,14 @@ Do not run destructive data commands such as `docker compose down -v` unless the
 
 ## Validation
 
-There is currently no dedicated test suite. For most code changes, run the narrowest meaningful validation:
+There is currently no dedicated test suite. For most code changes, run the narrowest meaningful validation.
+The repo requires Node 22+; if your host has an older version, run via the `web-dev` container:
 
 ```bash
+# Preferred: runs inside the Node 22 container
+docker compose --profile dev exec web-dev npm run build
+
+# Or directly if your host Node is 22+
 npm run build
 ```
 
@@ -102,7 +107,28 @@ Important storage keys in `coach-command-center.jsx`:
 - Event settings are stored under `event-settings`.
 - Storage is currently shared by default.
 
-When changing persisted shapes, add migration logic near the existing `migrate` or `migrateRoster` helpers. Do not assume old event data can be thrown away unless the user has explicitly said the branch is disposable.
+The `event-settings` shape (after the commit-3 migration):
+
+```js
+{
+  eventName: string,
+  competitionDay: 'jeopardy',   // always jeopardy now
+  startTime: number | null,     // Unix ms
+  durationHours: number,        // total event length
+  useLockedPhase: boolean,      // false = single flat timer
+  lockedPhaseHours: number,     // only used when useLockedPhase=true
+  lockedPhaseLabel: string,     // display name for locked phase
+  openPhaseLabel: string,       // display name for open phase
+  subsUsed: number,
+  // hrHours / ruHours kept during migration window, can be removed after next event
+}
+```
+
+When changing persisted shapes, add migration logic near the existing `migrate`, `migrateRoster`, or `migrateSettings` helpers. Do not assume old event data can be thrown away unless the user has explicitly said the branch is disposable.
+
+The `migrateSettings` function runs on every load. It is idempotent — running it twice produces the same result. Current migrations:
+- `competitionDay: 'ad'` → `'jeopardy'`
+- `hrHours`/`ruHours` present → convert to `durationHours`, `useLockedPhase=true`, `lockedPhaseHours`, `lockedPhaseLabel='Human Resistance'`, `openPhaseLabel='Robot Uprising'`
 
 Flags and notes are currently visible to everyone with access to the app on the tailnet. Do not add roles, private notes, or permissions without asking first.
 
@@ -116,6 +142,8 @@ Keep UI changes consistent with the existing tactical dashboard style:
 - Prefer small, local component changes inside `coach-command-center.jsx` over broad rewrites.
 - Avoid splitting the large app file only as a cleanup task during unrelated feature work. Split it only when it directly lowers risk for the requested change.
 - Keep existing keyboard, modal, and export flows working when modifying related UI.
+
+The coach app is jeopardy-only. The optional locked-phase feature supports ICC 2026's Human Resistance / Robot Uprising AI-usage rules; for other jeopardy events leave the locked phase off.
 
 Use React patterns already present in the file:
 
