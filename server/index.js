@@ -1,5 +1,6 @@
 import express from 'express';
 import pg from 'pg';
+import { fetchIccBundle, isIccConfigured } from './icc.js';
 
 const { Pool } = pg;
 
@@ -7,6 +8,8 @@ const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
 const APP_NAMESPACE = process.env.APP_NAMESPACE || 'coach-command-center';
 const CORS_ORIGIN = process.env.CORS_ORIGIN;
+const METACTF_API_BASE_URL = process.env.METACTF_API_BASE_URL;
+const METACTF_API_TOKEN = process.env.METACTF_API_TOKEN;
 
 if (!DATABASE_URL) {
   throw new Error('DATABASE_URL is required');
@@ -135,9 +138,59 @@ app.delete('/api/storage/:key', async (req, res, next) => {
   }
 });
 
+app.get('/api/icc/status', (_req, res) => {
+  res.json({ configured: isIccConfigured() });
+});
+
+app.get('/api/icc/bundle', async (_req, res, next) => {
+  try {
+    if (!isIccConfigured()) {
+      return res.status(503).json({
+        error: 'ICC live sync is not configured',
+        needs: ['ICC_COACH_TOKEN'],
+      });
+    }
+    const bundle = await fetchIccBundle();
+    return res.json(bundle);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get('/api/platform/metactf/snapshot', async (_req, res) => {
+  if (!METACTF_API_BASE_URL || !METACTF_API_TOKEN) {
+    return res.status(501).json({
+      error: 'MetaCTF platform adapter is not configured yet',
+      needs: ['METACTF_API_BASE_URL', 'METACTF_API_TOKEN', 'Swagger/OpenAPI field mapping'],
+      normalizedShape: {
+        source: 'metactf',
+        scoreboard: { ourRank: null, ourScore: null, gapAbove: null, gapBelow: null },
+        challenges: [
+          {
+            platformId: 'string',
+            title: 'string',
+            category: 'web|pwn|crypto|re|forensics|ai|hardware|misc',
+            currentPoints: 0,
+            solveCount: 0,
+            ourSolved: false,
+            rankImpact: null,
+          },
+        ],
+      },
+    });
+  }
+
+  return res.status(501).json({
+    error: 'MetaCTF adapter route is reserved; wire this to the Swagger/OpenAPI response once endpoint details are available',
+  });
+});
+
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(500).json({ error: 'Internal server error' });
+  const status = Number(error.status) || 500;
+  const message = error.message || 'Internal server error';
+  if (status >= 500) return res.status(500).json({ error: 'Internal server error' });
+  return res.status(status).json({ error: message });
 });
 
 await migrate();
