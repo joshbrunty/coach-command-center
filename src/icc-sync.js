@@ -11,15 +11,36 @@ const ICC_CATEGORY_MAP = {
 };
 
 export const ICC_RECOMMENDATIONS = {
-  start_now: { label: 'START NOW', color: '#10b981' },
-  triage: { label: 'TRIAGE ONLY', color: '#06b6d4' },
-  park_ai: { label: 'PARK UNTIL AI', color: '#a855f7' },
-  drop: { label: 'DROP UNLESS NEAR-SOLVED', color: '#ef4444' },
+  start_now: { label: 'HR TARGET', color: '#10b981' },
+  triage: { label: 'CAPTAIN CHECK', color: '#06b6d4' },
+  park_ai: { label: 'PARK FOR AI', color: '#a855f7' },
+  ai_cleanup: { label: 'AI CLEANUP', color: '#a855f7' },
+  drop: { label: 'DROP UNLESS NEAR', color: '#ef4444' },
 };
 
 function mapIccCategory(name) {
   const key = String(name || '').toLowerCase().trim();
   return ICC_CATEGORY_MAP[key] || 'misc';
+}
+
+function timestampMs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n < 1_000_000_000_000 ? n * 1000 : n;
+}
+
+function normalizeIccSolve(solve) {
+  if (!solve) return null;
+  return {
+    teamId: solve.team_id ?? null,
+    teamName: solve.team_name || '',
+    userId: solve.user_id ?? null,
+    username: solve.username || '',
+    timestamp: timestampMs(solve.timestamp),
+    points: Number(solve.points ?? 0) || 0,
+    isFirstBlood: Boolean(solve.is_first_blood),
+    source: 'icc',
+  };
 }
 
 function scoreboardGaps(standings, teamId) {
@@ -51,8 +72,8 @@ export function buildSnapshotFromIccBundle(bundle) {
   const importedAt = bundle.fetchedAt || Date.now();
 
   const challenges = (bundle.challengesSolves || []).map(ch => {
-    const solves = ch.solves || [];
-    const usaSolve = teamId != null ? solves.find(s => s.team_id === teamId) : null;
+    const solves = (ch.solves || []).map(normalizeIccSolve).filter(Boolean);
+    const usaSolve = teamId != null ? solves.find(s => String(s.teamId) === String(teamId)) : null;
     const maxPoints = Number(ch.human_resistance_points ?? ch.points ?? 0) || Number(ch.points ?? 0);
     const currentPoints = Number(ch.points ?? 0);
     return {
@@ -64,6 +85,8 @@ export function buildSnapshotFromIccBundle(bundle) {
       maxPoints,
       solveCount: solves.length,
       ourSolved: Boolean(usaSolve),
+      ourSolve: usaSolve || null,
+      solves,
       rankImpact: null,
       iccCategory: ch.category,
       attemptsRemaining: ch.attempts_remaining,
@@ -100,27 +123,51 @@ export function computeIccRecommendation(challenge, ctx = {}) {
   const nearSolved = challenge.captainConfidence === 'near-solved';
   const comp = ctx.competition;
   const nowSec = Math.floor(Date.now() / 1000);
-  const beforeRu = comp?.robot_uprising ? nowSec < comp.robot_uprising : (ctx.phase?.phase === 'locked');
+  const phaseName = ctx.phase?.phase;
+  const beforeRu = comp?.robot_uprising ? nowSec < comp.robot_uprising : (phaseName === 'locked' || phaseName === 'scheduled');
+  const inRu = comp?.robot_uprising ? nowSec >= comp.robot_uprising : phaseName === 'open';
   const hasSpecialist = (ctx.fit?.available?.length ?? 0) > 0;
   const cat = challenge.category;
   const aiFriendly = cat === 'misc' || cat === 'ai';
   const reasons = [];
 
-  if (solveCount >= 2 || decayed) {
-    if (nearSolved) {
-      reasons.push(decayed ? 'Points already decaying' : 'Multiple public solves');
-      reasons.push('Captain marked near-solved — finish or drop quickly');
-      return { key: 'triage', reasons };
+  if (inRu) {
+    if (solveCount >= 3 || aiFriendly || challenge.difficulty === 'easy') {
+      reasons.push(`${solveCount} public solve${solveCount === 1 ? '' : 's'} - AI cleanup candidate`);
+      reasons.push('Robot Uprising active - sort by easiest and most-solved');
+      return { key: 'ai_cleanup', reasons };
     }
-    if (decayed) reasons.push(`Value dropped (${points} vs ${maxPoints} max)`);
-    if (solveCount >= 2) reasons.push(`${solveCount} teams solved — heavy decay risk`);
-    return { key: 'drop', reasons };
+    reasons.push('Robot Uprising active - confirm whether human effort still matters');
+    return { key: 'triage', reasons };
   }
 
-  if (solveCount === 1 && !challenge.platformSolved) {
-    reasons.push('One team solved — first blood likely gone');
-    if (beforeRu && hasSpecialist && !aiFriendly) {
-      reasons.push('Specialist available before Robot Uprising');
+  if (solveCount >= 4) {
+    if (nearSolved) {
+      reasons.push(`${solveCount} public solves, but captain marked near-solved`);
+      reasons.push('Finish only if remaining cost is tiny');
+      return { key: 'triage', reasons };
+    }
+    reasons.push(`${solveCount} public solves - save manual time for lower-solve targets`);
+    if (decayed) reasons.push(`Current true value ${points} vs ${maxPoints} max`);
+    return { key: beforeRu ? 'park_ai' : 'drop', reasons };
+  }
+
+  if (solveCount === 3) {
+    if (nearSolved) {
+      reasons.push('3 public solves, but captain marked near-solved');
+      reasons.push('Finish only if it can convert quickly before HR ends');
+      return { key: 'triage', reasons };
+    }
+    reasons.push('3 public solves - discuss HR push vs AI park');
+    if (decayed) reasons.push(`Current true value ${points} vs ${maxPoints} max`);
+    return { key: 'triage', reasons };
+  }
+
+  if (solveCount >= 1) {
+    reasons.push(`${solveCount} public solve${solveCount === 1 ? '' : 's'} - still in HR target range`);
+    if (decayed) reasons.push(`Current true value ${points} vs ${maxPoints} max`);
+    if (beforeRu && (points >= 230 || hasSpecialist || nearSolved)) {
+      if (hasSpecialist) reasons.push('Specialist available before Robot Uprising');
       return { key: 'start_now', reasons };
     }
     reasons.push('Confirm path before committing more time');
@@ -128,24 +175,21 @@ export function computeIccRecommendation(challenge, ctx = {}) {
   }
 
   if (beforeRu) {
-    if (aiFriendly) {
-      reasons.push('Low HR priority — likely better after Robot Uprising');
-      return { key: 'park_ai', reasons };
-    }
     if (hasSpecialist && points >= 400) {
       reasons.push(`Untouched ${points}pt challenge`);
       reasons.push('Specialist available in play intel');
       return { key: 'start_now', reasons };
     }
-    reasons.push('Untouched — confirm assignee in coach meeting');
+    if (points >= 400 && !aiFriendly) {
+      reasons.push(`Untouched ${points}pt challenge`);
+      reasons.push('High upside if solved before HR ends');
+      return { key: 'start_now', reasons };
+    }
+    reasons.push('Untouched - confirm assignee in coach meeting');
     return { key: 'triage', reasons };
   }
 
-  if (aiFriendly) {
-    reasons.push('Robot Uprising active — AI-assisted lane');
-    return { key: 'start_now', reasons };
-  }
-  reasons.push('Post-RU — decide human finish vs AI assist');
+  reasons.push('Post-HR - decide human finish vs AI assist');
   return { key: 'triage', reasons };
 }
 
@@ -248,6 +292,7 @@ export function iccRecommendationScoreBoost(rec) {
     case 'start_now': return 85;
     case 'triage': return 25;
     case 'park_ai': return -35;
+    case 'ai_cleanup': return 45;
     case 'drop': return -95;
     default: return 0;
   }

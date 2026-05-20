@@ -113,6 +113,15 @@ const MAX_SUBS_PER_DAY = 2;
 const STALE_THRESHOLD_MS = 30 * 60 * 1000;
 const LOCK_WARN_MS = 60 * 60 * 1000;
 const LOCK_URGENT_MS = 30 * 60 * 1000;
+const HR_DECAY_POINTS = {
+  1: 500,
+  2: 339,
+  3: 230,
+  4: 156,
+  5: 106,
+  6: 72,
+  7: 50,
+};
 
 // ============================================================
 // HELPERS
@@ -177,13 +186,264 @@ function solvedPhase(challenge, settings) {
   return challenge.solvedAt <= lockedEndsAt ? 'locked' : 'open';
 }
 
+function solvedLockState(challenge, settings, now = Date.now()) {
+  const solvedIn = solvedPhase(challenge, settings);
+  if (solvedIn !== 'locked') return solvedIn;
+  const lockedMs = (settings.lockedPhaseHours ?? DEFAULT_HR_HOURS) * 3600_000;
+  const lockedEndsAt = settings.startTime + lockedMs;
+  return now < lockedEndsAt ? 'pending' : 'locked';
+}
+
+function normalizeTimestampMs(ts) {
+  if (ts == null || ts === '') return null;
+  const n = Number(ts);
+  if (Number.isFinite(n) && n > 0) return n < 1_000_000_000_000 ? n * 1000 : n;
+  const parsed = Date.parse(ts);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeSolverRecord(solver) {
+  if (!solver) return null;
+  const username = String(solver.username || solver.name || '').trim();
+  const userId = solver.userId ?? solver.user_id ?? null;
+  if (!username && userId == null) return null;
+  return {
+    username,
+    userId,
+    source: solver.source || 'manual',
+    solvedAt: normalizeTimestampMs(solver.solvedAt ?? solver.timestamp),
+    teamId: solver.teamId ?? solver.team_id ?? null,
+    teamName: solver.teamName || solver.team_name || '',
+    points: solver.points ?? null,
+  };
+}
+
+function normalizePublicSolveRecord(solve) {
+  if (!solve) return null;
+  return {
+    teamId: solve.teamId ?? solve.team_id ?? null,
+    teamName: solve.teamName || solve.team_name || '',
+    userId: solve.userId ?? solve.user_id ?? null,
+    username: solve.username || '',
+    timestamp: normalizeTimestampMs(solve.timestamp),
+    points: Number(solve.points ?? 0) || 0,
+    isFirstBlood: Boolean(solve.isFirstBlood ?? solve.is_first_blood),
+    source: solve.source || 'icc',
+  };
+}
+
+function solverFromLegacySolvedBy(challenge) {
+  if (!Array.isArray(challenge.solvedBy) || challenge.solvedBy.length !== 1) return null;
+  return normalizeSolverRecord({
+    username: challenge.solvedBy[0],
+    source: 'legacy',
+    solvedAt: challenge.solvedAt || null,
+  });
+}
+
+function solverDisplayName(challenge) {
+  const solver = normalizeSolverRecord(challenge?.solver) || solverFromLegacySolvedBy(challenge || {});
+  return solver?.username || (solver?.userId != null ? `user ${solver.userId}` : '');
+}
+
+function normalizedChallengeTitle(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isMeaningful(value) {
+  if (value == null) return false;
+  if (typeof value === 'string') return value.trim() !== '';
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+}
+
+function newestBy(records, predicate = null) {
+  const list = predicate ? records.filter(predicate) : records;
+  if (!list.length) return null;
+  return [...list].sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))[0];
+}
+
+function mergeUniqueStrings(records, field) {
+  const set = new Set();
+  records.forEach((r) => (r[field] || []).forEach((v) => {
+    const s = String(v || '').trim();
+    if (s) set.add(s);
+  }));
+  return [...set];
+}
+
+function mergeMeetingHistory(records) {
+  const seen = new Set();
+  const merged = [];
+  records.forEach((r) => {
+    (r.meetingHistory || []).forEach((m) => {
+      const id = m?.id || `${m?.createdAt || ''}:${m?.challengeId || ''}:${m?.summary || ''}`;
+      if (!seen.has(id)) {
+        seen.add(id);
+        merged.push(m);
+      }
+    });
+  });
+  return merged.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)).slice(-20);
+}
+
+function mergePlatformSolves(records) {
+  const seen = new Set();
+  const merged = [];
+  records.forEach((r) => {
+    (r.platformSolves || []).map(normalizePublicSolveRecord).filter(Boolean).forEach((s) => {
+      const key = `${s.teamId ?? ''}|${s.userId ?? ''}|${s.username ?? ''}|${s.timestamp ?? ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(s);
+      }
+    });
+  });
+  return merged.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+}
+
+function mergeChallengeGroup(group) {
+  const records = group.map(migrate);
+  const latest = newestBy(records) || records[0];
+  const latestIcc = newestBy(records, r => r.platformSource === 'icc');
+  const latestWithPlatform = newestBy(records, r => isMeaningful(r.platformId) || isMeaningful(r.platformPoints) || isMeaningful(r.platformSolveCount));
+  const platformAnchor = latestIcc || latestWithPlatform || latest;
+  const latestSolver = newestBy(records, r => Boolean(normalizeSolverRecord(r.solver)));
+  const iccSolver = newestBy(records, r => normalizeSolverRecord(r.solver)?.source === 'icc');
+  const projectedSolved = records.some(r => r.status === 'solved');
+  const platformSolved = records.some(r => r.platformSolved);
+  const solves = mergePlatformSolves(records);
+  const solver = normalizeSolverRecord((iccSolver || latestSolver || {}).solver) || null;
+  const solvedAtCandidates = records.map(r => r.solvedAt).filter(Boolean);
+  const solvedAt = solver?.solvedAt || (solvedAtCandidates.length ? Math.max(...solvedAtCandidates) : null);
+  const status = platformSolved ? 'solved' : (projectedSolved ? 'solved' : latest.status || 'unsolved');
+  const manualFields = ['flag', 'notes', 'url', 'captainProgress', 'captainTimeSpentMinutes', 'captainConfidence', 'phaseSolveConfidence', 'resourceAskCategory', 'resourceAskName', 'resourceNeed', 'coachDecision'];
+  const merged = {
+    ...latest,
+    id: latest.id,
+    title: platformAnchor.title || latest.title || '',
+    category: platformAnchor.category || latest.category || 'misc',
+    difficulty: latest.difficulty || 'medium',
+    points: platformAnchor.points ?? latest.points ?? 0,
+    createdAt: Math.min(...records.map(r => r.createdAt || Date.now())),
+    updatedAt: Math.max(...records.map(r => r.updatedAt || r.createdAt || 0)),
+    platformId: platformAnchor.platformId || '',
+    platformSource: platformAnchor.platformSource || '',
+    platformPoints: platformAnchor.platformPoints ?? latest.platformPoints ?? null,
+    platformMaxPoints: platformAnchor.platformMaxPoints ?? latest.platformMaxPoints ?? null,
+    platformSolveCount: Math.max(...records.map(r => Number(r.platformSolveCount ?? 0) || 0), solves.length) || null,
+    platformSolves: solves,
+    platformSolved,
+    status,
+    solvedAt: status === 'solved' ? solvedAt : null,
+    solver,
+    solvedBy: mergeUniqueStrings(records, 'solvedBy'),
+    assignees: mergeUniqueStrings(records, 'assignees'),
+    tags: mergeUniqueStrings(records, 'tags'),
+    meetingHistory: mergeMeetingHistory(records),
+    starred: records.some(r => Boolean(r.starred)),
+    hintsUsed: Math.max(...records.map(r => Number(r.hintsUsed || 0))),
+    lastMeetingAt: Math.max(...records.map(r => Number(r.lastMeetingAt || 0))) || null,
+  };
+  manualFields.forEach((field) => {
+    const newest = newestBy(records, r => isMeaningful(r[field]));
+    merged[field] = newest ? newest[field] : merged[field];
+  });
+  if (merged.solver?.username && !merged.solvedBy.includes(merged.solver.username)) {
+    merged.solvedBy = [...merged.solvedBy, merged.solver.username];
+  }
+  return migrate(merged);
+}
+
+function canonicalizeChallenges(challenges = []) {
+  const groups = [];
+  const pidMap = new Map();
+  const titleMap = new Map();
+  const keyForPid = (c) => {
+    const pid = String(c.platformId || '').trim();
+    return pid ? `pid:${pid.toLowerCase()}` : '';
+  };
+  const keyForTitle = (c) => {
+    const t = normalizedChallengeTitle(c.title);
+    return t ? `title:${t}` : '';
+  };
+  const canMergeByTitle = (incoming, existing) => {
+    const inPid = String(incoming.platformId || '').trim().toLowerCase();
+    const exPid = String(existing.platformId || '').trim().toLowerCase();
+    return !(inPid && exPid && inPid !== exPid);
+  };
+  challenges.map(migrate).forEach((ch) => {
+    const pidKey = keyForPid(ch);
+    const titleKey = keyForTitle(ch);
+    let group = pidKey ? pidMap.get(pidKey) : null;
+    if (!group && titleKey) {
+      const candidate = titleMap.get(titleKey);
+      if (candidate && canMergeByTitle(ch, candidate[0])) group = candidate;
+    }
+    if (!group) {
+      group = [];
+      groups.push(group);
+    }
+    group.push(ch);
+    if (pidKey) pidMap.set(pidKey, group);
+    if (titleKey) titleMap.set(titleKey, group);
+  });
+  const deduped = groups.map(mergeChallengeGroup);
+  const canonicalIds = new Set(deduped.map(c => c.id));
+  const duplicateIds = challenges.map(migrate).map(c => c.id).filter(id => !canonicalIds.has(id));
+  return { challenges: deduped, duplicateIds };
+}
+
+function operatorMatchesSolver(challenge, operator) {
+  const solver = normalizeSolverRecord(challenge?.solver) || solverFromLegacySolvedBy(challenge || {});
+  if (!operator) return false;
+  const operatorAliases = [
+    operator.name,
+    operator.iccUsername,
+    String(operator.name || '').split('(')[0],
+  ].map(v => String(v || '').trim().toLowerCase()).filter(Boolean);
+  if (!solver && Array.isArray(challenge?.solvedBy) && challenge.solvedBy.length) {
+    const names = challenge.solvedBy.map(v => String(v || '').trim().toLowerCase()).filter(Boolean);
+    if (!names.length) return false;
+    return operatorAliases.some(alias => names.includes(alias));
+  }
+  if (!solver) return false;
+  const solverUser = String(solver.username || '').toLowerCase();
+  const solverId = solver.userId != null ? String(solver.userId) : '';
+  const opId = operator.iccUserId != null && operator.iccUserId !== '' ? String(operator.iccUserId) : '';
+  return (solverUser && operatorAliases.includes(solverUser))
+    || (solverId && ((opId && solverId === opId) || operatorAliases.includes(`user ${solverId}`)));
+}
+
+function rosterNameForSolver(solver, roster = []) {
+  const normalized = normalizeSolverRecord(solver);
+  if (!normalized) return '';
+  const match = roster.find(p => operatorMatchesSolver({ solver: normalized }, p));
+  return match?.name || '';
+}
+
+function pointDecayIntel(challenge) {
+  const current = Number(challenge.platformPoints ?? challenge.points ?? 0) || 0;
+  const max = Number(challenge.platformMaxPoints ?? current) || 0;
+  const solves = Array.isArray(challenge.platformSolves) ? challenge.platformSolves.map(normalizePublicSolveRecord).filter(Boolean) : [];
+  solves.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  const lastSolve = solves.length ? solves[solves.length - 1] : null;
+  return {
+    current,
+    max,
+    lost: Math.max(0, max - current),
+    solveCount: Number(challenge.platformSolveCount ?? solves.length) || 0,
+    lastSolve,
+  };
+}
+
 const newChallenge = (overrides = {}) => ({
   id: uid(), title: '', category: 'misc', difficulty: 'medium', points: 0,
   status: 'unsolved', assignees: [], flag: '', notes: '', url: '', tags: [],
-  createdAt: Date.now(), updatedAt: Date.now(), solvedAt: null, solvedBy: [],
+  createdAt: Date.now(), updatedAt: Date.now(), solvedAt: null, solvedBy: [], solver: null,
   starred: false, hintsUsed: 0,
   platformId: '', platformSource: '', platformPoints: null, platformMaxPoints: null,
-  platformSolveCount: null, platformSolved: false, captainProgress: null, captainTimeSpentMinutes: null,
+  platformSolveCount: null, platformSolves: [], platformSolved: false, captainProgress: null, captainTimeSpentMinutes: null,
   captainConfidence: 'unknown', phaseSolveConfidence: 'unknown',
   rankImpact: null, resourceAskCategory: '', resourceAskName: '',
   resourceNeed: 'none', coachDecision: 'watch', lastMeetingAt: null, meetingHistory: [],
@@ -193,12 +453,14 @@ const newChallenge = (overrides = {}) => ({
 const migrate = (ch) => ({
   ...ch, points: ch.points || 0, tags: ch.tags || [],
   assignees: ch.assignees || [], solvedBy: ch.solvedBy || [],
+  solver: normalizeSolverRecord(ch.solver) || solverFromLegacySolvedBy(ch),
   hintsUsed: ch.hintsUsed || 0,
   platformId: ch.platformId || '',
   platformSource: ch.platformSource || '',
   platformPoints: ch.platformPoints ?? null,
   platformMaxPoints: ch.platformMaxPoints ?? null,
   platformSolveCount: ch.platformSolveCount ?? null,
+  platformSolves: Array.isArray(ch.platformSolves) ? ch.platformSolves.map(normalizePublicSolveRecord).filter(Boolean) : [],
   platformSolved: ch.platformSolved ?? false,
   captainProgress: ch.captainProgress ?? null,
   captainTimeSpentMinutes: ch.captainTimeSpentMinutes ?? null,
@@ -216,8 +478,8 @@ const migrate = (ch) => ({
 const migrateRoster = (roster) => {
   if (!Array.isArray(roster)) return [];
   return roster.map(p => typeof p === 'string'
-    ? { name: p, status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '' }
-    : { status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '', ...p });
+    ? { name: p, status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '', iccUsername: '', iccUserId: '' }
+    : { status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '', iccUsername: '', iccUserId: '', ...p });
 };
 
 function parseCSVRows(text) {
@@ -259,6 +521,12 @@ function normalizePlatformChallenge(raw, source = 'manual') {
   const solvedRaw = readFirst(raw, ['ourSolved', 'solved', 'teamSolved', 'Solved', 'status']);
   const solvedText = String(solvedRaw ?? '').toLowerCase();
   const ourSolved = solvedRaw === true || solvedText === 'true' || solvedText === 'yes' || solvedText === 'solved';
+  const solverName = String(readFirst(raw, ['solver', 'solvedBy', 'solved_by', 'username', 'Username']) || '').trim();
+  const solverId = readFirst(raw, ['solverId', 'solver_id', 'userId', 'user_id']);
+  const solvedAt = readFirst(raw, ['solvedAt', 'solved_at', 'timestamp', 'Timestamp']);
+  const solver = ourSolved && (solverName || solverId != null)
+    ? normalizeSolverRecord({ username: solverName, userId: solverId, source, solvedAt })
+    : null;
   return {
     platformId: id || title,
     platformSource: source || 'manual',
@@ -268,6 +536,8 @@ function normalizePlatformChallenge(raw, source = 'manual') {
     solveCount: solves,
     rankImpact,
     ourSolved,
+    ourSolve: solver,
+    solves: [],
     raw,
   };
 }
@@ -325,31 +595,44 @@ function buildPlatformSnapshot({ source, challenges, scoreboard = null }) {
   };
 }
 
-function applyPlatformSnapshotToChallenges(challenges, snapshot) {
-  const next = [...challenges];
+function applyPlatformSnapshotToChallenges(challenges, snapshot, roster = []) {
+  const next = [...canonicalizeChallenges(challenges).challenges];
   snapshot.challenges.forEach(pc => {
     const idx = next.findIndex(c =>
       (pc.platformId && c.platformId === pc.platformId) ||
       c.title.trim().toLowerCase() === pc.title.trim().toLowerCase()
     );
+    const existing = idx >= 0 ? next[idx] : null;
+    const apiSolver = normalizeSolverRecord(pc.ourSolve);
+    const nextSolver = pc.ourSolved ? (apiSolver || existing?.solver || null) : existing?.solver || null;
+    const rosterSolverName = apiSolver ? rosterNameForSolver(apiSolver, roster) : '';
+    const assignees = rosterSolverName && !(existing?.assignees || []).includes(rosterSolverName)
+      ? [...(existing?.assignees || []), rosterSolverName]
+      : existing?.assignees || [];
     const patch = {
       title: pc.title,
       category: pc.category,
-      points: pc.currentPoints || next[idx]?.points || 0,
+      points: pc.currentPoints || existing?.points || 0,
       platformId: pc.platformId,
       platformSource: pc.platformSource,
       platformPoints: pc.currentPoints,
-      platformMaxPoints: pc.maxPoints ?? next[idx]?.platformMaxPoints ?? pc.currentPoints,
+      platformMaxPoints: pc.maxPoints ?? existing?.platformMaxPoints ?? pc.currentPoints,
       platformSolveCount: pc.solveCount,
+      platformSolves: Array.isArray(pc.solves) ? pc.solves.map(normalizePublicSolveRecord).filter(Boolean) : existing?.platformSolves || [],
       platformSolved: pc.ourSolved,
-      rankImpact: pc.rankImpact ?? next[idx]?.rankImpact ?? null,
-      status: pc.ourSolved ? 'solved' : next[idx]?.status || 'unsolved',
-      solvedAt: pc.ourSolved ? (next[idx]?.solvedAt || Date.now()) : next[idx]?.solvedAt || null,
+      rankImpact: pc.rankImpact ?? existing?.rankImpact ?? null,
+      assignees,
+      status: pc.ourSolved ? 'solved' : existing?.status || 'unsolved',
+      solvedAt: pc.ourSolved ? (apiSolver?.solvedAt || existing?.solvedAt || Date.now()) : existing?.solvedAt || null,
+      solver: nextSolver,
+      solvedBy: pc.ourSolved && nextSolver?.username
+        ? [...new Set([...(existing?.solvedBy || []), nextSolver.username])]
+        : existing?.solvedBy || [],
     };
     if (idx >= 0) next[idx] = migrate({ ...next[idx], ...patch });
     else next.push(newChallenge(patch));
   });
-  return next;
+  return canonicalizeChallenges(next).challenges;
 }
 
 // ============================================================
@@ -400,8 +683,29 @@ const storage = {
         try { const r = await window.storage.get(k, SHARED); return r ? migrate(JSON.parse(r.value)) : null; }
         catch { return null; }
       }));
-      return items.filter(Boolean);
+      return canonicalizeChallenges(items.filter(Boolean)).challenges;
     } catch (e) { console.error('listChallenges', e); return []; }
+  },
+  async saveCanonicalChallenges(challenges) {
+    const res = await window.storage.list(CH_PREFIX, SHARED).catch(() => ({ keys: [] }));
+    const keys = res?.keys || [];
+    const stored = await Promise.all(keys.map(async (k) => {
+      try {
+        const r = await window.storage.get(k, SHARED);
+        return r ? migrate(JSON.parse(r.value)) : null;
+      } catch {
+        return null;
+      }
+    }));
+    const byId = new Map();
+    stored.filter(Boolean).forEach((ch) => byId.set(ch.id, ch));
+    (challenges || []).map(migrate).forEach((ch) => byId.set(ch.id, ch));
+    const { challenges: deduped } = canonicalizeChallenges([...byId.values()]);
+    const keepIds = new Set(deduped.map(ch => ch.id));
+    const duplicateIds = [...byId.keys()].filter(id => !keepIds.has(id));
+    await Promise.all(deduped.map(ch => window.storage.set(`${CH_PREFIX}${ch.id}`, JSON.stringify(ch), SHARED)));
+    await Promise.all(duplicateIds.map(id => window.storage.delete(`${CH_PREFIX}${id}`, SHARED).catch(() => null)));
+    return deduped;
   },
   async saveChallenge(ch) {
     try { await window.storage.set(`${CH_PREFIX}${ch.id}`, JSON.stringify(ch), SHARED); return true; }
@@ -469,12 +773,84 @@ const storage = {
   },
 };
 
+function numericValue(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function decayPointsForSolveCount(solveCount, fallback = HR_DECAY_POINTS[1]) {
+  const n = Math.max(0, Math.ceil(numericValue(solveCount, 0)));
+  if (n <= 0) return fallback;
+  if (n >= 7) return HR_DECAY_POINTS[7];
+  return HR_DECAY_POINTS[n] ?? fallback;
+}
+
+function isHrPriorityWindow(phase) {
+  return phase?.phase === 'locked' || phase?.phase === 'scheduled';
+}
+
+function isAiCleanupWindow(phase) {
+  return phase?.phase === 'open';
+}
+
+function hrHoursRemaining(phase) {
+  if (phase?.phase === 'locked') return Math.max(0, (phase.phaseRemaining || 0) / 3600_000);
+  if (phase?.phase === 'scheduled') return Math.max(0, (phase.lockedMs || 0) / 3600_000);
+  return 0;
+}
+
+function projectedAdditionalHrSolves(publicSolves, phase) {
+  if (!isHrPriorityWindow(phase)) return 0;
+  const hoursRemaining = hrHoursRemaining(phase);
+  if (publicSolves >= 4) return 0;
+  if (publicSolves === 3) return hoursRemaining > 1 ? 2 : 1;
+  if (publicSolves >= 1) return 1;
+  return hoursRemaining > 1.5 ? 1 : 0;
+}
+
+function buildHrValueModel(challenge, phase) {
+  const trueCurrentPoints = Math.max(0, numericValue(challenge.platformPoints ?? challenge.points ?? 0));
+  const publicSolves = Math.max(0, Math.floor(numericValue(challenge.platformSolveCount ?? 0)));
+  const usaSolveNumber = publicSolves + 1;
+  const currentCeiling = trueCurrentPoints || decayPointsForSolveCount(Math.max(1, publicSolves), HR_DECAY_POINTS[1]);
+  const usaNextTable = decayPointsForSolveCount(usaSolveNumber, currentCeiling);
+  const usaNextForecast = Math.min(currentCeiling, usaNextTable);
+  const extraBeforeLock = projectedAdditionalHrSolves(publicSolves, phase);
+  const hrLockSolveCount = usaSolveNumber + extraBeforeLock;
+  const hrLockForecast = isHrPriorityWindow(phase)
+    ? Math.min(usaNextForecast, decayPointsForSolveCount(hrLockSolveCount, usaNextForecast))
+    : null;
+  const aiAdditionalSolves = publicSolves >= 4 ? 1 : publicSolves === 3 ? 2 : 3;
+  const aiCleanupSolveCount = usaSolveNumber + extraBeforeLock + aiAdditionalSolves;
+  const aiCleanupForecast = Math.min(
+    usaNextForecast,
+    decayPointsForSolveCount(aiCleanupSolveCount, usaNextForecast),
+  );
+  const lockGain = hrLockForecast == null ? 0 : Math.max(0, hrLockForecast - aiCleanupForecast);
+
+  return {
+    trueCurrentPoints,
+    publicSolves,
+    usaSolveNumber,
+    usaNextForecast,
+    extraBeforeLock,
+    hrLockSolveCount,
+    hrLockForecast,
+    aiCleanupForecast,
+    aiCleanupSolveCount,
+    lockGain,
+    shouldParkForAi: publicSolves >= 4,
+    shouldDiscussPark: publicSolves === 3,
+    lowSolveTarget: publicSolves <= 2,
+  };
+}
+
 function phaseValueRisk(challenge, settings, phase) {
-  const points = challenge.platformPoints ?? challenge.points ?? 0;
-  if (!settings.startTime || !(settings.useLockedPhase ?? false) || phase.phase !== 'locked') return 0;
-  const hoursRemaining = Math.max(0, (phase.phaseRemaining || 0) / 3600_000);
+  if (!settings.startTime || !(settings.useLockedPhase ?? false) || !isHrPriorityWindow(phase)) return 0;
+  const model = buildHrValueModel(challenge, phase);
+  const hoursRemaining = hrHoursRemaining(phase);
   const urgency = hoursRemaining <= 0.5 ? 1 : hoursRemaining <= 1 ? 0.8 : hoursRemaining <= 2 ? 0.55 : 0.3;
-  return Math.round(points * urgency);
+  return Math.round((model.lockGain || model.hrLockForecast || 0) * urgency);
 }
 
 function confidenceWeight(value, dict) {
@@ -511,6 +887,9 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
   const timeSpent = Number(challenge.captainTimeSpentMinutes ?? 0);
   const solveCount = Number(challenge.platformSolveCount ?? 0);
   const assigneeCount = challenge.assignees?.length || 0;
+  const hrValue = buildHrValueModel(challenge, phase);
+  const inHrWindow = isHrPriorityWindow(phase);
+  const inAiWindow = isAiCleanupWindow(phase);
   const phaseRisk = phaseValueRisk(challenge, settings, phase);
   const rankImpact = estimateRankImpact(challenge, snapshot);
   const captainConfidence = confidenceWeight(challenge.captainConfidence, CAPTAIN_CONFIDENCE);
@@ -523,9 +902,29 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
   });
   const staleMeeting = !challenge.lastMeetingAt || Date.now() - challenge.lastMeetingAt > 90 * 60_000;
   const opportunityCost = assigneeCount * Math.max(1, Math.round(timeSpent / 30));
-  const externalSignal = solveCount === 0 ? -8 : Math.min(40, solveCount * 4);
+  const difficultyDots = DIFFICULTIES[challenge.difficulty]?.dots || 2;
+  const easeScore = (4 - difficultyDots) * 140;
+  const aiCleanupScore = easeScore + (Math.min(solveCount, 7) * 70) + (progress * 1.5)
+    + (challenge.captainConfidence === 'near-solved' ? 220 : 0)
+    + (challenge.status === 'stuck' ? 35 : 0);
+  const externalSignal = solveCount === 0 ? 30 : Math.max(-80, 120 - (solveCount * 35));
 
-  let score = currentPoints + phaseRisk + rankImpact + (captainConfidence * 2) + phaseConfidence + progress + externalSignal;
+  let score;
+  if (inAiWindow) {
+    score = aiCleanupScore + (captainConfidence * 1.2) + progress - Math.max(0, currentPoints - 230) * 0.2;
+  } else if (inHrWindow) {
+    const lockValue = hrValue.hrLockForecast ?? hrValue.usaNextForecast;
+    score = (lockValue * 2) + hrValue.lockGain + rankImpact + (captainConfidence * 1.4)
+      + phaseConfidence + progress + externalSignal + phaseRisk;
+    if (hrValue.usaNextForecast >= 500) score += 140;
+    else if (hrValue.usaNextForecast >= 339) score += 85;
+    else if (hrValue.usaNextForecast >= 230) score += 35;
+    if (hrValue.shouldDiscussPark) score -= challenge.captainConfidence === 'near-solved' ? 10 : 95;
+    if (hrValue.shouldParkForAi) score -= challenge.captainConfidence === 'near-solved' ? 65 : 280;
+  } else {
+    score = currentPoints + phaseRisk + rankImpact + (captainConfidence * 2) + phaseConfidence + progress
+      + (solveCount === 0 ? -8 : Math.min(40, solveCount * 4));
+  }
   score -= opportunityCost * 10;
   if (challenge.status === 'stuck') score -= 20;
   if (challenge.resourceNeed === 'drop' || challenge.coachDecision === 'drop' || challenge.coachDecision === 'park') score -= 90;
@@ -534,15 +933,24 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
   score += iccRecommendationScoreBoost(iccRec);
 
   const reasons = [];
-  if (currentPoints > 0) reasons.push(`${currentPoints} current points`);
+  if (currentPoints > 0) reasons.push(`TRUE: ${currentPoints} ICC current`);
+  if (hrValue.usaNextForecast > 0) reasons.push(`FORECAST: USA next solve ${hrValue.usaNextForecast}pt`);
+  if (inHrWindow && hrValue.hrLockForecast != null) {
+    reasons.push(`FORECAST: HR lock ${hrValue.hrLockForecast}pt after +${hrValue.extraBeforeLock} HR solve${hrValue.extraBeforeLock === 1 ? '' : 's'}`);
+  } else if (inAiWindow) {
+    reasons.push(`FORECAST: AI cleanup ${hrValue.aiCleanupForecast}pt`);
+  }
+  if (hrValue.lockGain > 0) reasons.push(`FORECAST: ${hrValue.lockGain}pt gain over waiting for AI cleanup`);
   if (rankImpact >= 80) reasons.push('could change scoreboard position');
   else if (rankImpact > 0) reasons.push(`${rankImpact} rank-impact estimate`);
-  if (phaseRisk > 0) reasons.push(`${phaseRisk} phase value-at-risk before score freeze`);
+  if (phaseRisk > 0) reasons.push(`${phaseRisk} phase urgency value`);
   if (challenge.captainConfidence && challenge.captainConfidence !== 'unknown') reasons.push(`${CAPTAIN_CONFIDENCE[challenge.captainConfidence]?.label} captain confidence`);
   if (challenge.phaseSolveConfidence && challenge.phaseSolveConfidence !== 'unknown') reasons.push(`${PHASE_SOLVE_CONFIDENCE[challenge.phaseSolveConfidence]?.label} before phase change`);
   if (progress > 0) reasons.push(`${progress}% progress detail`);
   if (timeSpent > 0) reasons.push(`${timeSpent}m already invested`);
-  if (solveCount > 0) reasons.push(`${solveCount} public solve${solveCount === 1 ? '' : 's'} suggests feasibility`);
+  if (solveCount >= 4) reasons.push(`${solveCount} public solves - park for AI unless finish is tiny`);
+  else if (solveCount === 3) reasons.push('3 public solves - captain discussion before HR push');
+  else if (solveCount > 0) reasons.push(`${solveCount} public solve${solveCount === 1 ? '' : 's'} - still an HR target`);
   else if (challenge.platformId) reasons.push('no public solves yet');
   if (assigneeCount > 0) reasons.push(`${assigneeCount} operator${assigneeCount === 1 ? '' : 's'} assigned`);
   if (challenge.resourceNeed && challenge.resourceNeed !== 'none') reasons.push(RESOURCE_NEEDS[challenge.resourceNeed]?.label || challenge.resourceNeed);
@@ -552,7 +960,21 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
   const missingConfidence = !challenge.captainConfidence || challenge.captainConfidence === 'unknown' || !challenge.phaseSolveConfidence || challenge.phaseSolveConfidence === 'unknown';
   let lane = 'ask';
   if (challenge.status === 'solved' || challenge.platformSolved) lane = 'solved';
-  else if (challenge.resourceNeed === 'drop' || challenge.coachDecision === 'drop' || challenge.coachDecision === 'park' || (captainConfidence <= 20 && timeSpent >= 90 && currentPoints < 250)) lane = 'drop';
+  else if (challenge.resourceNeed === 'drop' || challenge.coachDecision === 'drop' || (captainConfidence <= 20 && timeSpent >= 90 && currentPoints < 250)) lane = 'drop';
+  else if (inAiWindow) {
+    if (challenge.captainConfidence === 'near-solved' || progress >= 35) lane = 'continue';
+    else if (challenge.resourceNeed === 'operator' || challenge.resourceNeed === 'specialist' || challenge.resourceNeed === 'rest' || challenge.status === 'stuck') lane = 'resource';
+    else lane = 'drop';
+  } else if (inHrWindow) {
+    if (challenge.coachDecision === 'park' || (hrValue.shouldParkForAi && challenge.captainConfidence !== 'near-solved')) lane = 'drop';
+    else if (challenge.captainConfidence === 'near-solved' || progress >= 70) lane = 'continue';
+    else if (hrValue.shouldDiscussPark && challenge.captainConfidence !== 'near-solved') lane = 'ask';
+    else if (hrValue.lowSolveTarget && (hrValue.usaNextForecast >= 500 || hrValue.hrLockForecast >= 339 || currentPoints >= 450)) lane = 'win';
+    else if (hrValue.lowSolveTarget) lane = 'lock';
+    else if (challenge.resourceNeed === 'operator' || challenge.resourceNeed === 'specialist' || challenge.resourceNeed === 'rest' || challenge.status === 'stuck') lane = 'resource';
+    else if (missingConfidence || staleMeeting) lane = 'ask';
+    else if (captainConfidence >= 45 || progress >= 25) lane = 'continue';
+  } else if (challenge.coachDecision === 'park') lane = 'drop';
   else if (missingConfidence || staleMeeting) lane = 'ask';
   else if (rankImpact >= 80) lane = 'win';
   else if (phaseRisk > 0 && (phaseConfidence >= 45 || captainConfidence >= 45)) lane = 'lock';
@@ -560,6 +982,10 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
   else if (captainConfidence >= 45 || progress >= 25) lane = 'continue';
 
   const questionPrompts = [];
+  if (inHrWindow && solveCount <= 2) questionPrompts.push(`Can we convert this before Human Resistance ends and lock roughly ${hrValue.hrLockForecast ?? hrValue.usaNextForecast}pt?`);
+  if (inHrWindow && solveCount === 3) questionPrompts.push('Ask captain if this is near enough to justify HR time before parking for AI.');
+  if (inHrWindow && solveCount >= 4) questionPrompts.push('Park for AI unless captain says the remaining finish cost is tiny.');
+  if (inAiWindow) questionPrompts.push('AI cleanup: take the easiest, most-solved items first unless a captain has a near-finished path.');
   if (challenge.captainConfidence === 'unknown') questionPrompts.push('Ask captain: low, medium, high, or near-solved confidence?');
   if (phaseRisk > 0 && challenge.phaseSolveConfidence === 'unknown') questionPrompts.push('Ask whether this can realistically solve before the phase freeze.');
   if (staleMeeting) questionPrompts.push('Get current operators assigned and whether to add, swap, or drop resources.');
@@ -572,6 +998,8 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
     lane,
     score: Math.round(score),
     currentPoints,
+    hrValue,
+    aiCleanupScore,
     phaseRisk,
     rankImpact,
     progress,
@@ -587,18 +1015,31 @@ function buildInsightForChallenge(challenge, roster, settings, phase, snapshot) 
 }
 
 function buildInsights(challenges, roster, settings, phase, snapshot) {
+  const inAiWindow = isAiCleanupWindow(phase);
   const lanes = {
-    win: { label: 'WIN IMPACT', color: '#d4a843', items: [] },
-    lock: { label: 'LOCK BEFORE PHASE', color: '#f59e0b', items: [] },
-    ask: { label: 'ASK CAPTAINS', color: '#06b6d4', items: [] },
+    win: { label: 'LOCK 500S', color: '#d4a843', items: [] },
+    lock: { label: 'MANUAL HR TARGETS', color: '#f59e0b', items: [] },
+    ask: { label: 'CAPTAIN CHECK', color: '#06b6d4', items: [] },
     resource: { label: 'RESOURCE SHIFT', color: '#a855f7', items: [] },
-    continue: { label: 'CONTINUE', color: '#10b981', items: [] },
-    drop: { label: 'DROP OR PARK', color: '#ef4444', items: [] },
+    continue: { label: 'FINISH IF NEAR', color: '#10b981', items: [] },
+    drop: { label: inAiWindow ? 'AI CLEANUP' : 'PARK FOR AI', color: inAiWindow ? '#a855f7' : '#ef4444', items: [] },
     solved: { label: 'SOLVED / VERIFIED', color: '#10b981', items: [] },
   };
   challenges.map(ch => buildInsightForChallenge(ch, roster, settings, phase, snapshot))
     .forEach(insight => lanes[insight.lane].items.push(insight));
-  Object.values(lanes).forEach(lane => lane.items.sort((a, b) => b.score - a.score));
+  Object.entries(lanes).forEach(([key, lane]) => {
+    lane.items.sort((a, b) => {
+      if (inAiWindow && key === 'drop') {
+        const aDots = DIFFICULTIES[a.challenge.difficulty]?.dots || 2;
+        const bDots = DIFFICULTIES[b.challenge.difficulty]?.dots || 2;
+        if (aDots !== bDots) return aDots - bDots;
+        const aSolves = a.hrValue?.publicSolves ?? Number(a.challenge.platformSolveCount ?? 0);
+        const bSolves = b.hrValue?.publicSolves ?? Number(b.challenge.platformSolveCount ?? 0);
+        if (aSolves !== bSolves) return bSolves - aSolves;
+      }
+      return b.score - a.score;
+    });
+  });
   return lanes;
 }
 
@@ -626,7 +1067,7 @@ function USCTLogo({ size = 64 }) {
 // PRIMITIVES
 // ============================================================
 
-const Badge = ({ children, color = '#94a3b8', variant = 'soft', size = 'sm', style = {} }) => {
+const Badge = ({ children, color = '#94a3b8', variant = 'soft', size = 'sm', style = {}, ...rest }) => {
   const base = {
     display: 'inline-flex', alignItems: 'center', gap: 6,
     fontFamily: '"Chakra Petch", sans-serif', fontWeight: 600,
@@ -636,7 +1077,7 @@ const Badge = ({ children, color = '#94a3b8', variant = 'soft', size = 'sm', sty
   };
   if (variant === 'soft') { base.background = `${color}1a`; base.color = color; }
   else { base.background = color; base.color = '#0a0e1a'; }
-  return <span style={{ ...base, ...style }}>{children}</span>;
+  return <span style={{ ...base, ...style }} {...rest}>{children}</span>;
 };
 
 const DifficultyDots = ({ level, size = 6 }) => {
@@ -718,15 +1159,16 @@ const Input = ({ value, onChange, placeholder, type = 'text', style = {}, ...res
     {...rest} />
 );
 
-const Select = ({ value, onChange, options, style = {} }) => (
+const Select = ({ value, onChange, options, style = {}, ...rest }) => (
   <select value={value} onChange={onChange} style={{
     background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(255,255,255,0.12)',
     color: '#fff', padding: '9px 12px', borderRadius: 3,
     fontFamily: '"Chakra Petch", sans-serif', fontSize: 13, outline: 'none',
-    cursor: 'pointer', appearance: 'none',
+    cursor: rest.disabled ? 'not-allowed' : 'pointer', appearance: 'none',
     backgroundImage: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23d4a843' stroke-width='2'><polyline points='6 9 12 15 18 9'/></svg>")`,
-    backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center', paddingRight: 30, ...style,
-  }}>
+    backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center', paddingRight: 30,
+    opacity: rest.disabled ? 0.65 : 1, ...style,
+  }} {...rest}>
     {options.map(o => (
       <option key={o.value} value={o.value} style={{ background: '#141b2e', color: '#fff' }}>
         {o.label}
@@ -810,21 +1252,22 @@ export default function CoachCommandCenter() {
 
   const upsertChallenge = useCallback(async (ch) => {
     const updated = { ...ch, updatedAt: Date.now() };
-    setChallenges(prev => {
-      const idx = prev.findIndex(c => c.id === updated.id);
-      if (idx >= 0) { const next = [...prev]; next[idx] = updated; return next; }
-      return [...prev, updated];
-    });
-    await storage.saveChallenge(updated);
-  }, []);
+    const idx = challenges.findIndex(c => c.id === updated.id);
+    const next = idx >= 0 ? [...challenges] : [...challenges, updated];
+    if (idx >= 0) next[idx] = updated;
+    const canonical = canonicalizeChallenges(next).challenges;
+    setChallenges(canonical);
+    await storage.saveCanonicalChallenges(canonical);
+  }, [challenges]);
 
   const savePlatformSnapshot = useCallback(async (snapshot) => {
-    const merged = applyPlatformSnapshotToChallenges(challenges, snapshot);
+    const merged = applyPlatformSnapshotToChallenges(challenges, snapshot, roster);
+    const deduped = canonicalizeChallenges(merged).challenges;
     setPlatformSnapshots(prev => [snapshot, ...prev].sort((a, b) => (b.importedAt || 0) - (a.importedAt || 0)));
-    setChallenges(merged);
+    setChallenges(deduped);
     await storage.savePlatformSnapshot(snapshot);
-    await Promise.all(merged.map(ch => storage.saveChallenge({ ...ch, updatedAt: Date.now() })));
-  }, [challenges]);
+    await storage.saveCanonicalChallenges(deduped.map(ch => ({ ...ch, updatedAt: Date.now() })));
+  }, [challenges, roster]);
 
   const syncIccFromApi = useCallback(async () => {
     if (iccSyncInFlight.current) return;
@@ -841,12 +1284,11 @@ export default function CoachCommandCenter() {
         lastSyncAt: Date.now(),
         alerts,
       });
-      setChallenges(prev => {
-        const merged = applyPlatformSnapshotToChallenges(prev, snapshot);
-        storage.savePlatformSnapshot(snapshot);
-        merged.forEach(ch => storage.saveChallenge({ ...ch, updatedAt: Date.now() }));
-        return merged;
-      });
+      const current = await storage.listChallenges();
+      const merged = applyPlatformSnapshotToChallenges(current, snapshot, roster);
+      setChallenges(merged);
+      await storage.savePlatformSnapshot(snapshot);
+      await storage.saveCanonicalChallenges(merged.map(ch => ({ ...ch, updatedAt: Date.now() })));
       setPlatformSnapshots(prev => {
         const rest = prev.filter(s => s.id !== snapshot.id);
         return [snapshot, ...rest].slice(0, 30);
@@ -861,7 +1303,7 @@ export default function CoachCommandCenter() {
     } finally {
       iccSyncInFlight.current = false;
     }
-  }, []);
+  }, [roster]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1023,9 +1465,12 @@ export default function CoachCommandCenter() {
       key: k, total: challenges.filter(c => c.category === k).length,
       solved: challenges.filter(c => c.category === k && c.status === 'solved').length,
     }));
-    const solvedHR = challenges.filter(c => solvedPhase(c, settings) === 'locked').length;
-    const pointsHR = challenges.filter(c => solvedPhase(c, settings) === 'locked').reduce((s, c) => s + (c.points || 0), 0);
-    return { total, solved, inProg, stuck, points, totalOps, engagedOps: engagedOps.size, byCat, solvedHR, pointsHR };
+    const hrSolved = challenges.filter(c => solvedPhase(c, settings) === 'locked');
+    const solvedHR = hrSolved.length;
+    const pendingHR = hrSolved.filter(c => solvedLockState(c, settings) === 'pending').length;
+    const lockedHR = hrSolved.filter(c => solvedLockState(c, settings) === 'locked').length;
+    const pointsHR = hrSolved.reduce((s, c) => s + (c.points || 0), 0);
+    return { total, solved, inProg, stuck, points, totalOps, engagedOps: engagedOps.size, byCat, solvedHR, pendingHR, lockedHR, pointsHR };
   }, [challenges, activeRoster, settings, tick]);
 
   const selected = challenges.find(c => c.id === selectedId);
@@ -1156,7 +1601,12 @@ export default function CoachCommandCenter() {
           <StatCard label="STUCK" value={stats.stuck} icon={<AlertCircle size={14} />} accent="#dc2626" />
           <StatCard label="OPS ENGAGED" value={`${stats.engagedOps}/${stats.totalOps}`} icon={<UserCheck size={14} />} accent="#d4a843" />
           {settings.startTime ? (
-            <StatCard label="LOCKED IN HR" value={`${stats.solvedHR} · ${stats.pointsHR}pt`} icon={<Lock size={14} />} accent="#10b981" />
+            <StatCard
+              label={phase.phase === 'locked' ? 'HR LOCK PENDING' : 'HR LOCKED'}
+              value={`${stats.solvedHR} · ${stats.pointsHR}pt`}
+              icon={<Lock size={14} />}
+              accent={stats.pendingHR > 0 ? '#f59e0b' : '#10b981'}
+              sub={stats.pendingHR > 0 ? `${stats.pendingHR} pending` : `${stats.lockedHR} locked`} />
           ) : (
             <StatCard label="POINTS" value={stats.points} icon={<Award size={14} />} accent="#d4a843" />
           )}
@@ -1247,7 +1697,7 @@ export default function CoachCommandCenter() {
                 gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))',
               }}>
                 {visible.map(c => (
-                  <ChallengeCard key={c.id} challenge={c} settings={settings}
+                  <ChallengeCard key={c.id} challenge={c} settings={settings} phase={phase}
                     iccRec={iccRecommendations.get(c.id)}
                     onClick={() => setSelectedId(c.id)}
                     onToggleStar={() => upsertChallenge({ ...c, starred: !c.starred })} />
@@ -1301,7 +1751,7 @@ export default function CoachCommandCenter() {
       </div>
 
       {selected && (
-        <ChallengeDetail challenge={selected} roster={activeRoster} settings={settings} phase={phase}
+        <ChallengeDetail challenge={selected} roster={roster} settings={settings} phase={phase}
           onClose={() => setSelectedId(null)}
           onSave={upsertChallenge}
           onDelete={() => removeChallenge(selected.id)} />
@@ -1327,7 +1777,7 @@ export default function CoachCommandCenter() {
           onClearAll={clearAllData} />
       )}
       {selectedOp && (
-        <OperatorDetailModal name={selectedOp} challenges={challenges} settings={settings}
+        <OperatorDetailModal operator={roster.find(p => p.name === selectedOp) || { name: selectedOp }} challenges={challenges} settings={settings}
           onClose={() => setSelectedOp(null)}
           onOpenChallenge={(id) => { setSelectedOp(null); setSelectedId(id); }} />
       )}
@@ -1631,11 +2081,20 @@ function StatCard({ label, value, icon, accent = '#d4a843', sub }) {
 // CHALLENGE CARD
 // ============================================================
 
-function ChallengeCard({ challenge, settings, iccRec, onClick, onToggleStar }) {
+function ChallengeCard({ challenge, settings, phase, iccRec, onClick, onToggleStar }) {
   const cat = CATEGORIES[challenge.category] || CATEGORIES.misc;
   const stat = STATUSES[challenge.status];
   const isSolved = challenge.status === 'solved';
   const solvedIn = solvedPhase(challenge, settings);
+  const lockState = solvedLockState(challenge, settings);
+  const solverName = solverDisplayName(challenge);
+  const solverSource = challenge.solver?.source || '';
+  const decay = pointDecayIntel(challenge);
+  const showDecay = challenge.platformSource && decay.max > 0;
+  const valueModel = !isSolved ? buildHrValueModel(challenge, phase) : null;
+  const showValueForecast = valueModel && (isHrPriorityWindow(phase) || isAiCleanupWindow(phase));
+  const forecastLabel = valueModel?.hrLockForecast == null ? 'AI FCST' : 'LOCK FCST';
+  const forecastValue = valueModel?.hrLockForecast == null ? valueModel?.aiCleanupForecast : valueModel?.hrLockForecast;
   const isStale = (challenge.status === 'in-progress' || challenge.status === 'stuck') &&
                   (Date.now() - challenge.updatedAt) > STALE_THRESHOLD_MS;
 
@@ -1673,8 +2132,18 @@ function ChallengeCard({ challenge, settings, iccRec, onClick, onToggleStar }) {
               {challenge.points} PT
             </span>
           )}
-          {solvedIn === 'locked' && (
-            <span title="Score locked at end of locked phase" style={{
+          {lockState === 'pending' && (
+            <span title="Solved during HR; value locks when Human Resistance ends" style={{
+              display: 'inline-flex', alignItems: 'center', gap: 3,
+              fontSize: 9, padding: '2px 6px', background: 'rgba(245,158,11,0.12)',
+              border: '1px solid rgba(245,158,11,0.4)', color: '#f59e0b',
+              borderRadius: 2, letterSpacing: '0.1em', fontWeight: 600,
+            }}>
+              <Clock size={9} /> LOCK PENDING
+            </span>
+          )}
+          {lockState === 'locked' && (
+            <span title="Score locked at end of Human Resistance" style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
               fontSize: 9, padding: '2px 6px', background: 'rgba(16,185,129,0.12)',
               border: '1px solid rgba(16,185,129,0.4)', color: '#10b981',
@@ -1746,6 +2215,48 @@ function ChallengeCard({ challenge, settings, iccRec, onClick, onToggleStar }) {
           </>
         )}
       </div>
+
+      {(isSolved || solverName) && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10,
+          color: solverName ? '#10b981' : 'rgba(255,255,255,0.45)', fontSize: 11,
+          letterSpacing: '0.08em', minHeight: 20,
+        }}>
+          <Award size={12} />
+          {solverName ? (
+            <span>SOLVER <b style={{ color: '#fff' }}>{solverName}</b>{solverSource === 'icc' ? ' · ICC' : ' · COACH'}</span>
+          ) : (
+            <span>SOLVER PENDING ICC SYNC</span>
+          )}
+        </div>
+      )}
+
+      {showDecay && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10,
+          color: 'rgba(255,255,255,0.55)', fontSize: 11, letterSpacing: '0.06em',
+          fontFamily: '"JetBrains Mono", monospace',
+        }}>
+          <Activity size={12} color="#06b6d4" />
+          <span>
+            {decay.solveCount} solves · {decay.current}/{decay.max}pt
+            {decay.lost > 0 ? ` · -${decay.lost}` : ''}
+          </span>
+        </div>
+      )}
+
+      {showValueForecast && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10,
+          color: 'rgba(255,255,255,0.58)', fontSize: 10, letterSpacing: '0.05em',
+          fontFamily: '"JetBrains Mono", monospace',
+        }}>
+          <Target size={12} color="#d4a843" />
+          <span>
+            TRUE {valueModel.trueCurrentPoints} · USA {valueModel.usaNextForecast} · {forecastLabel} {forecastValue}
+          </span>
+        </div>
+      )}
 
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -1856,6 +2367,7 @@ function MeetingsView({
   const lockCount = lanes.lock.items.length;
   const resourceCount = lanes.resource.items.length;
   const askCount = lanes.ask.items.length;
+  const cleanupCount = lanes.drop.items.length;
 
   const handleImport = async () => {
     const parsed = parsePlatformImport(paste, source);
@@ -1888,7 +2400,9 @@ function MeetingsView({
     setImportMessage(`Added manual row: ${title}.`);
   };
 
-  const boardOrder = ['win', 'lock', 'ask', 'resource', 'continue', 'drop'];
+  const boardOrder = phase.phase === 'open'
+    ? ['drop', 'continue', 'ask', 'resource', 'win', 'lock']
+    : ['win', 'lock', 'ask', 'resource', 'continue', 'drop'];
 
   return (
     <div>
@@ -1901,10 +2415,10 @@ function MeetingsView({
           <div>
             <SectionLabel icon={<Target size={11} />}>PRIORITY BOARD</SectionLabel>
             <div style={{ fontSize: 20, fontWeight: 700, color: '#fff', letterSpacing: '0.04em' }}>
-              What should coaches push, resource, continue, or drop next?
+              What should coaches lock before HR ends, park for AI, or clean up now?
             </div>
             <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.62)', lineHeight: 1.5, marginTop: 4 }}>
-              Board order is driven by points, phase lock-in risk, public solves, rank impact, and captain-derived confidence.
+              Board order separates ICC true points from forecasts: USA next solve, HR lock value, AI cleanup decay, public solves, and captain confidence.
             </div>
           </div>
           <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', textAlign: 'right', lineHeight: 1.5 }}>
@@ -1918,16 +2432,16 @@ function MeetingsView({
         }}>
           <StatCard label="ACTIONABLE" value={actionableCount} icon={<Target size={14} />} accent="#d4a843"
             sub={latestSnapshot ? `${fmtRelative(latestSnapshot.importedAt)}` : 'manual'} />
-          <StatCard label="WIN IMPACT" value={winCount} icon={<Award size={14} />} accent="#d4a843"
-            sub={latestSnapshot?.scoreboard?.gapAbove ? `${latestSnapshot.scoreboard.gapAbove}pt gap` : 'scoreboard'} />
-          <StatCard label="LOCK WATCH" value={lockCount} icon={<Lock size={14} />} accent="#f59e0b"
+          <StatCard label="LOCK 500S" value={winCount} icon={<Award size={14} />} accent="#d4a843"
+            sub={latestSnapshot?.scoreboard?.gapAbove ? `${latestSnapshot.scoreboard.gapAbove}pt gap` : 'low-solve HR'} />
+          <StatCard label="HR TARGETS" value={lockCount} icon={<Lock size={14} />} accent="#f59e0b"
             sub={phase.phase === 'locked' ? fmtCountdown(phase.phaseRemaining) : 'phase inactive'} />
           <StatCard label="RESOURCE CALLS" value={resourceCount} icon={<Users size={14} />} accent="#06b6d4"
             sub={`${roster.length} active ops`} />
-          <StatCard label="ASK CAPTAINS" value={askCount} icon={<Radio size={14} />} accent="#06b6d4"
+          <StatCard label="CAPTAIN CHECK" value={askCount} icon={<Radio size={14} />} accent="#06b6d4"
             sub="missing confidence" />
-          <StatCard label="MEETINGS" value={meetings.length} icon={<Clock size={14} />} accent="#94a3b8"
-            sub={meetings[0] ? fmtRelative(meetings[0].createdAt) : 'none yet'} />
+          <StatCard label={phase.phase === 'open' ? 'AI CLEANUP' : 'PARK FOR AI'} value={cleanupCount} icon={<Clock size={14} />} accent={phase.phase === 'open' ? '#a855f7' : '#ef4444'}
+            sub={phase.phase === 'open' ? 'easy + solved first' : '4+ solves'} />
         </div>
       </div>
 
@@ -2129,6 +2643,10 @@ function InsightCard({ insight, color, onQuickUpdate, onOpenChallenge, onUpdateM
   const need = RESOURCE_NEEDS[c.resourceNeed] || RESOURCE_NEEDS.none;
   const confidence = CAPTAIN_CONFIDENCE[c.captainConfidence] || CAPTAIN_CONFIDENCE.unknown;
   const phaseConfidence = PHASE_SOLVE_CONFIDENCE[c.phaseSolveConfidence] || PHASE_SOLVE_CONFIDENCE.unknown;
+  const valueModel = insight.hrValue;
+  const trueLabel = c.platformSource === 'icc' ? 'ICC TRUE' : 'TRUE';
+  const forecastLabel = valueModel?.hrLockForecast == null ? 'AI FCST' : 'LOCK FCST';
+  const forecastValue = valueModel?.hrLockForecast == null ? valueModel?.aiCleanupForecast : valueModel?.hrLockForecast;
   return (
     <div style={{
       background: 'rgba(255,255,255,0.025)', border: `1px solid ${color}45`,
@@ -2156,11 +2674,12 @@ function InsightCard({ insight, color, onQuickUpdate, onOpenChallenge, onUpdateM
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 10 }}>
-        <Stat label="POINTS" value={insight.currentPoints || '-'} accent="#d4a843" />
-        <Stat label="SOLVES" value={c.platformSolveCount ?? '-'} accent="#06b6d4" />
-        <Stat label="RANK IMPACT" value={insight.rankImpact || '-'} accent="#d4a843" />
-        <Stat label="PHASE RISK" value={insight.phaseRisk || '-'} accent="#ef4444" />
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 6, marginBottom: 10 }}>
+        <Stat label={trueLabel} value={insight.currentPoints || '-'} accent="#d4a843" />
+        <Stat label="USA NEXT" value={valueModel?.usaNextForecast || '-'} accent="#10b981" />
+        <Stat label={forecastLabel} value={forecastValue || '-'} accent={valueModel?.hrLockForecast == null ? '#a855f7' : '#f59e0b'} />
+        <Stat label="SOLVES" value={valueModel?.publicSolves ?? c.platformSolveCount ?? '-'} accent="#06b6d4" />
+        <Stat label="GAIN" value={valueModel?.lockGain || '-'} accent="#d4a843" />
         <Stat label="TIME" value={insight.timeSpent ? `${insight.timeSpent}m` : '-'} accent="#f59e0b" />
       </div>
 
@@ -2354,20 +2873,53 @@ function Avatar({ name, index, size = 22 }) {
 // ============================================================
 
 function OperatorsView({ roster, allRoster, challenges, onSelectChallenge, onSelectOperator, onAddOperator }) {
+  const rosterWithSolverIntel = useMemo(() => {
+    const combined = [...roster];
+    const seen = new Set();
+    roster.forEach((p) => {
+      [p.name, p.iccUsername, p.iccUserId].filter(Boolean).forEach(v => seen.add(String(v).trim().toLowerCase()));
+    });
+    challenges.forEach((c) => {
+      if (c.status !== 'solved') return;
+      const solver = normalizeSolverRecord(c.solver);
+      if (!solver) return;
+      if (roster.some(p => operatorMatchesSolver(c, p))) return;
+      const key = solver.userId != null ? `id:${solver.userId}` : `name:${String(solver.username || '').toLowerCase()}`;
+      if (seen.has(key)) return;
+      const name = solver.username || (solver.userId != null ? `user ${solver.userId}` : '');
+      if (!name) return;
+      seen.add(key);
+      seen.add(String(name).toLowerCase());
+      combined.push({
+        name,
+        iccUsername: solver.username || '',
+        iccUserId: solver.userId ?? '',
+        status: 'active',
+        source: 'icc-solver',
+        subbedOutAt: null,
+        strengths: [],
+        experienceLevel: 'solid',
+        availabilityStatus: 'available',
+        fatigueNote: 'ICC solver not mapped to roster',
+      });
+    });
+    return combined;
+  }, [roster, challenges]);
+
   const ops = useMemo(() => {
-    return roster.map(p => {
+    return rosterWithSolverIntel.map(p => {
       const assigned = challenges.filter(c => c.assignees.includes(p.name));
       const engaged = assigned.filter(c => c.status === 'in-progress' || c.status === 'stuck');
-      const solved = assigned.filter(c => c.status === 'solved');
+      const solved = challenges.filter(c => c.status === 'solved' && operatorMatchesSolver(c, p));
       const catCount = {};
       assigned.forEach(c => { catCount[c.category] = (catCount[c.category] || 0) + 1; });
       return { player: p, assigned, engaged, solved, catCount };
     });
-  }, [roster, challenges]);
+  }, [rosterWithSolverIntel, challenges]);
 
   const subbedOut = allRoster.filter(p => p.status === 'subbed-out');
 
-  if (roster.length === 0) {
+  if (rosterWithSolverIntel.length === 0) {
     return (
       <div style={{
         padding: '60px 20px', textAlign: 'center',
@@ -2417,6 +2969,9 @@ function OperatorsView({ roster, allRoster, challenges, onSelectChallenge, onSel
               }}>
                 <Avatar name={p.name} index={0} size={20} />
                 <span style={{ textDecoration: 'line-through' }}>{p.name}</span>
+                <span style={{ fontSize: 10, color: '#10b981', letterSpacing: '0.08em' }}>
+                  {challenges.filter(c => c.status === 'solved' && operatorMatchesSolver(c, p)).length} SOLVED
+                </span>
               </div>
             ))}
           </div>
@@ -2452,9 +3007,15 @@ function OperatorCard({ op, onSelectChallenge, onSelectOperator }) {
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 15, fontWeight: 600, color: '#fff' }}>{player.name}</div>
           <div style={{ fontSize: 10, letterSpacing: '0.15em', fontWeight: 600, color: statusColor }}>
-            {statusLabel}
+            {player.source === 'icc-solver' ? '● ICC SOLVER · MAP IN ROSTER' : statusLabel}
           </div>
         </div>
+        {player.source === 'icc-solver' && (
+          <div title="Solver from ICC API not mapped to a roster operator" style={{
+            padding: '2px 6px', background: 'rgba(6,182,212,0.12)', border: '1px solid rgba(6,182,212,0.35)',
+            borderRadius: 2, fontSize: 9, color: '#06b6d4', letterSpacing: '0.1em',
+          }}>ICC</div>
+        )}
         {isOverloaded && (
           <div title="Heavy load — 3+ engaged challenges" style={{
             padding: '2px 6px', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)',
@@ -2507,6 +3068,30 @@ function OperatorCard({ op, onSelectChallenge, onSelectOperator }) {
         <Stat label="SOLVED" value={solved.length} accent="#10b981" />
       </div>
 
+      {solved.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 9, letterSpacing: '0.2em', color: '#10b981', marginBottom: 5 }}>SOLVE CREDIT</div>
+          {solved.slice(0, 3).map(c => (
+            <button key={c.id} onClick={(e) => { e.stopPropagation(); onSelectChallenge(c.id); }} style={{
+              width: '100%', textAlign: 'left',
+              background: 'rgba(16,185,129,0.06)',
+              border: '1px solid rgba(16,185,129,0.2)',
+              borderRadius: 3, padding: '5px 8px', marginBottom: 4, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+              fontFamily: '"Chakra Petch", sans-serif', color: '#fff', fontSize: 12,
+            }}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.title || 'Untitled'}</span>
+              <span style={{ color: c.solver?.source === 'icc' ? '#10b981' : '#f59e0b', fontSize: 9, letterSpacing: '0.1em' }}>
+                {c.solver?.source === 'icc' ? 'ICC' : 'COACH'}
+              </span>
+            </button>
+          ))}
+          {solved.length > 3 && (
+            <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.45)' }}>+{solved.length - 3} more solved</div>
+          )}
+        </div>
+      )}
+
       {Object.keys(catCount).length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
           {Object.entries(catCount).map(([k, n]) => {
@@ -2540,8 +3125,10 @@ function Stat({ label, value, accent = '#fff' }) {
 // OPERATOR DETAIL MODAL
 // ============================================================
 
-function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChallenge }) {
+function OperatorDetailModal({ operator, challenges, settings, onClose, onOpenChallenge }) {
+  const name = operator.name;
   const assigned = challenges.filter(c => c.assignees.includes(name));
+  const credited = challenges.filter(c => c.status === 'solved' && operatorMatchesSolver(c, operator));
   const grouped = useMemo(() => {
     const byStatus = { 'in-progress': [], stuck: [], unsolved: [], solved: [] };
     assigned.forEach(c => { if (byStatus[c.status]) byStatus[c.status].push(c); });
@@ -2556,6 +3143,11 @@ function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChalle
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 10, letterSpacing: '0.25em', color: '#d4a843', fontWeight: 600 }}>◆ OPERATOR DOSSIER</div>
           <div style={{ fontSize: 22, fontWeight: 700, color: '#fff' }}>{name}</div>
+          {operator.iccUsername && (
+            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', marginTop: 2 }}>
+              ICC username: {operator.iccUsername}
+            </div>
+          )}
         </div>
         <IconBtn onClick={onClose}><X size={14} /></IconBtn>
       </div>
@@ -2564,15 +3156,43 @@ function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChalle
           <Stat label="ASSIGNED" value={assigned.length} />
           <Stat label="ENGAGED" value={grouped['in-progress'].length} accent="#f59e0b" />
           <Stat label="STUCK" value={grouped.stuck.length} accent="#ef4444" />
-          <Stat label="SOLVED" value={grouped.solved.length} accent="#10b981" />
+          <Stat label="SOLVED" value={credited.length} accent="#10b981" />
         </div>
 
-        {assigned.length === 0 ? (
+        {credited.length > 0 && (
+          <div style={{ marginBottom: 18 }}>
+            <SectionLabel icon={<Award size={11} />}>SOLVE CREDIT · {credited.length}</SectionLabel>
+            {credited.map(c => {
+              const cat = CATEGORIES[c.category] || CATEGORIES.misc;
+              return (
+                <button key={c.id} onClick={() => onOpenChallenge(c.id)} style={{
+                  width: '100%', textAlign: 'left',
+                  background: 'rgba(16,185,129,0.05)', border: '1px solid rgba(16,185,129,0.18)',
+                  borderRadius: 3, padding: '9px 12px', marginBottom: 5, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+                  fontFamily: '"Chakra Petch", sans-serif', color: '#fff', fontSize: 14,
+                }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1 }}>
+                    <Badge color={cat.color}>{cat.label}</Badge>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {c.title || 'Untitled'}
+                    </span>
+                  </span>
+                  <span style={{ fontSize: 9, letterSpacing: '0.1em', color: c.solver?.source === 'icc' ? '#10b981' : '#f59e0b' }}>
+                    {c.solver?.source === 'icc' ? 'ICC' : 'COACH'}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {assigned.length === 0 && credited.length === 0 ? (
           <div style={{
             padding: 20, textAlign: 'center', border: '1px dashed rgba(255,255,255,0.1)',
             borderRadius: 3, color: 'rgba(255,255,255,0.5)', fontSize: 13,
           }}>
-            Not assigned to any challenges yet.
+            Not assigned or credited on any challenges yet.
           </div>
         ) : (
           <>
@@ -2580,9 +3200,9 @@ function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChalle
               grouped[s].length > 0 && (
                 <div key={s} style={{ marginBottom: 16 }}>
                   <SectionLabel icon={<ChevronRight size={11} />}>{STATUSES[s].label} · {grouped[s].length}</SectionLabel>
-                  {grouped[s].map(c => {
-                    const sp = solvedPhase(c, settings);
-                    const cat = CATEGORIES[c.category] || CATEGORIES.misc;
+	                  {grouped[s].map(c => {
+	                    const lockState = solvedLockState(c, settings);
+	                    const cat = CATEGORIES[c.category] || CATEGORIES.misc;
                     return (
                       <button key={c.id} onClick={() => onOpenChallenge(c.id)} style={{
                         width: '100%', textAlign: 'left',
@@ -2601,11 +3221,16 @@ function OperatorDetailModal({ name, challenges, settings, onClose, onOpenChalle
                           </span>
                         </span>
                         <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          {sp === 'locked' && (
-                            <span style={{ fontSize: 9, color: '#10b981', letterSpacing: '0.1em' }}>
-                              <Lock size={9} style={{ verticalAlign: -1 }} /> LOCKED
-                            </span>
-                          )}
+	                          {lockState === 'pending' && (
+	                            <span style={{ fontSize: 9, color: '#f59e0b', letterSpacing: '0.1em' }}>
+	                              <Clock size={9} style={{ verticalAlign: -1 }} /> PENDING
+	                            </span>
+	                          )}
+	                          {lockState === 'locked' && (
+	                            <span style={{ fontSize: 9, color: '#10b981', letterSpacing: '0.1em' }}>
+	                              <Lock size={9} style={{ verticalAlign: -1 }} /> LOCKED
+	                            </span>
+	                          )}
                           <span style={{
                             fontSize: 11, color: 'rgba(255,255,255,0.55)',
                             fontFamily: '"JetBrains Mono", monospace',
@@ -2711,6 +3336,13 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
     update({ assignees: has ? draft.assignees.filter(a => a !== name) : [...draft.assignees, name] });
   };
 
+  const setManualSolver = (name) => {
+    const solver = name
+      ? normalizeSolverRecord({ username: name, source: 'manual', solvedAt: draft.solvedAt || Date.now() })
+      : null;
+    update({ solver, solvedBy: solver?.username ? [solver.username] : [] });
+  };
+
   const addTag = () => {
     const t = tagInput.trim().toLowerCase().replace(/\s+/g, '-');
     if (t && !draft.tags.includes(t)) update({ tags: [...draft.tags, t] });
@@ -2719,12 +3351,36 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
 
   const markSolved = async () => {
     const now = Date.now();
-    await onSave({ ...draft, status: 'solved', solvedAt: now, solvedBy: draft.assignees });
+    const existingSolver = normalizeSolverRecord(draft.solver);
+    const projectedSolver = existingSolver || (draft.assignees.length === 1
+      ? normalizeSolverRecord({ username: draft.assignees[0], source: 'manual', solvedAt: now })
+      : null);
+    await onSave({
+      ...draft,
+      status: 'solved',
+      solvedAt: now,
+      solver: projectedSolver,
+      solvedBy: projectedSolver?.username ? [projectedSolver.username] : [],
+    });
     onClose();
   };
 
   const cat = CATEGORIES[draft.category] || CATEGORIES.misc;
   const sp = solvedPhase(draft, settings);
+  const lockState = solvedLockState(draft, settings);
+  const solverName = solverDisplayName(draft);
+  const solverSource = draft.solver?.source || '';
+  const hasIccSolver = solverSource === 'icc';
+  const decay = pointDecayIntel(draft);
+  const publicSolves = Array.isArray(draft.platformSolves) ? draft.platformSolves.map(normalizePublicSolveRecord).filter(Boolean) : [];
+  publicSolves.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  const solverOptions = [
+    { value: '', label: draft.status === 'solved' ? 'Pending ICC / none' : 'No solver' },
+    ...roster.map(p => ({ value: p.name, label: p.iccUsername ? `${p.name} (${p.iccUsername})` : p.name })),
+  ];
+  if (solverName && !solverOptions.some(o => o.value === solverName)) {
+    solverOptions.push({ value: solverName, label: `${solverName} (ICC)` });
+  }
 
   return (
     <Modal onClose={onClose} width={760}>
@@ -2737,7 +3393,10 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <Badge color={cat.color}>{cat.label}</Badge>
           <DifficultyDots level={draft.difficulty} />
-          {sp === 'locked' && (
+          {lockState === 'pending' && (
+            <Badge color="#f59e0b"><Clock size={10} /> HR SOLVE · LOCKS AT PHASE END</Badge>
+          )}
+          {lockState === 'locked' && (
             <Badge color="#10b981"><Lock size={10} /> SCORE LOCKED · {(settings.lockedPhaseLabel || 'Phase 1').toUpperCase()}</Badge>
           )}
           {sp === 'open' && (
@@ -2804,9 +3463,10 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
                   <button key={p.name} onClick={() => toggleAssignee(p.name)} style={{
                     background: on ? 'rgba(212,168,67,0.15)' : 'rgba(255,255,255,0.03)',
                     border: `1px solid ${on ? '#d4a843' : 'rgba(255,255,255,0.1)'}`,
-                    color: on ? '#d4a843' : 'rgba(255,255,255,0.7)',
+                    color: p.status === 'subbed-out' ? 'rgba(255,255,255,0.35)' : on ? '#d4a843' : 'rgba(255,255,255,0.7)',
                     padding: '6px 12px', borderRadius: 3, cursor: 'pointer',
                     fontFamily: '"Chakra Petch", sans-serif', fontSize: 12, fontWeight: 500,
+                    textDecoration: p.status === 'subbed-out' ? 'line-through' : 'none',
                   }}>
                     {on && <Check size={11} style={{ marginRight: 4, verticalAlign: -1 }} />}
                     {p.name}
@@ -2816,6 +3476,29 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
             </div>
           </div>
         )}
+
+        <div style={{ marginBottom: 18 }}>
+          <SectionLabel icon={<Award size={11} />}>SOLVER CREDIT</SectionLabel>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, alignItems: 'center',
+            padding: 12, background: 'rgba(16,185,129,0.04)', border: '1px solid rgba(16,185,129,0.16)', borderRadius: 4,
+          }}>
+            <div>
+              <Select value={solverName} disabled={hasIccSolver}
+                onChange={e => setManualSolver(e.target.value)}
+                options={solverOptions}
+                style={{ width: '100%' }} />
+              <div style={{ marginTop: 6, fontSize: 11, color: 'rgba(255,255,255,0.5)', lineHeight: 1.4 }}>
+                {hasIccSolver
+                  ? `Authoritative ICC solve · user_id ${draft.solver?.userId ?? 'unknown'}`
+                  : draft.status === 'solved'
+                    ? 'Coach projection. ICC sync will replace this when the official Team USA solve appears.'
+                    : 'Set after marking solved if coaches need a projection before official submission.'}
+              </div>
+            </div>
+            <Badge color={hasIccSolver ? '#10b981' : '#f59e0b'}>{hasIccSolver ? 'ICC' : 'COACH'}</Badge>
+          </div>
+        </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 18 }}>
           <div>
@@ -2835,10 +3518,17 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
             <Select value={draft.status} onChange={e => {
               const status = e.target.value;
               const now = Date.now();
+              const existingSolver = normalizeSolverRecord(draft.solver);
+              const projectedSolver = status === 'solved'
+                ? existingSolver || (draft.assignees.length === 1
+                  ? normalizeSolverRecord({ username: draft.assignees[0], source: 'manual', solvedAt: draft.solvedAt || now })
+                  : null)
+                : null;
               update({
                 status,
                 solvedAt: status === 'solved' ? (draft.solvedAt || now) : null,
-                solvedBy: status === 'solved' ? (draft.solvedBy?.length ? draft.solvedBy : draft.assignees) : [],
+                solver: projectedSolver,
+                solvedBy: projectedSolver?.username ? [projectedSolver.username] : [],
               });
             }}
               options={Object.entries(STATUSES).map(([k, v]) => ({ value: k, label: v.label }))}
@@ -2864,12 +3554,41 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
               <Stat label="PROGRESS" value={draft.captainProgress != null ? `${draft.captainProgress}%` : '-'} accent="#10b981" />
               <Stat label="TIME SPENT" value={draft.captainTimeSpentMinutes != null ? `${draft.captainTimeSpentMinutes}m` : '-'} accent="#f59e0b" />
             </div>
+            {decay.max > 0 && (
+              <div style={{
+                display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 10,
+                padding: '8px 0', borderTop: '1px dashed rgba(255,255,255,0.08)', borderBottom: '1px dashed rgba(255,255,255,0.08)',
+              }}>
+                <Stat label="MAX VALUE" value={decay.max} accent="#10b981" />
+                <Stat label="CURRENT VALUE" value={decay.current} accent="#d4a843" />
+                <Stat label="DECAY LOST" value={decay.lost} accent={decay.lost > 0 ? '#ef4444' : '#94a3b8'} />
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               {draft.platformSource && <Badge color="#94a3b8">{draft.platformSource}</Badge>}
               {draft.resourceNeed && draft.resourceNeed !== 'none' && <Badge color={RESOURCE_NEEDS[draft.resourceNeed]?.color || '#94a3b8'}>{RESOURCE_NEEDS[draft.resourceNeed]?.label || draft.resourceNeed}</Badge>}
               {draft.coachDecision && <Badge color={COACH_DECISIONS[draft.coachDecision]?.color || '#94a3b8'}>{COACH_DECISIONS[draft.coachDecision]?.label || draft.coachDecision}</Badge>}
               {draft.lastMeetingAt && <Badge color="#d4a843">MEETING {fmtRelative(draft.lastMeetingAt)}</Badge>}
             </div>
+            {publicSolves.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <SectionLabel icon={<Activity size={11} />}>PUBLIC SOLVE / DECAY TRACE</SectionLabel>
+                <div style={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 3, overflow: 'hidden' }}>
+                  {publicSolves.slice(-8).map((s, i) => (
+                    <div key={`${s.teamId || 'team'}-${s.userId || s.username || i}-${s.timestamp || i}`} style={{
+                      display: 'grid', gridTemplateColumns: '1.2fr 1fr 0.7fr 1fr', gap: 8,
+                      padding: '7px 10px', borderTop: i === 0 ? 'none' : '1px solid rgba(255,255,255,0.05)',
+                      fontSize: 12, color: 'rgba(255,255,255,0.72)', alignItems: 'center',
+                    }}>
+                      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.teamName || `team ${s.teamId || '?'}`}</div>
+                      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: String(s.teamId) === String(draft.solver?.teamId) ? '#10b981' : 'rgba(255,255,255,0.6)' }}>{s.username || '-'}</div>
+                      <div style={{ fontFamily: '"JetBrains Mono", monospace', color: '#d4a843' }}>{s.points || 0}pt</div>
+                      <div style={{ fontFamily: '"JetBrains Mono", monospace', color: 'rgba(255,255,255,0.45)' }}>{s.timestamp ? fmtRelative(s.timestamp) : '-'}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -2948,6 +3667,7 @@ function ChallengeDetail({ challenge, roster, settings, phase, onClose, onSave, 
           <div>CREATED: {new Date(draft.createdAt).toLocaleString()}</div>
           <div>UPDATED: {new Date(draft.updatedAt).toLocaleString()}</div>
           {draft.solvedAt && <div style={{ color: '#10b981' }}>SOLVED: {new Date(draft.solvedAt).toLocaleString()}</div>}
+          {solverName && <div style={{ color: '#10b981' }}>SOLVER: {solverName} ({hasIccSolver ? 'ICC' : 'coach'})</div>}
         </div>
 
         {/* Footer: Delete + Save side-by-side, both prominent */}
@@ -3064,6 +3784,8 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
     points: challenges.filter(c => c.status === 'solved').reduce((s, c) => s + (c.points || 0), 0),
     solvedHR: challenges.filter(c => solvedPhase(c, settings) === 'locked').length,
     solvedRU: challenges.filter(c => solvedPhase(c, settings) === 'open').length,
+    pendingHR: challenges.filter(c => solvedLockState(c, settings) === 'pending').length,
+    lockedHR: challenges.filter(c => solvedLockState(c, settings) === 'locked').length,
     pointsHR: challenges.filter(c => solvedPhase(c, settings) === 'locked').reduce((s, c) => s + (c.points || 0), 0),
   };
 
@@ -3076,7 +3798,7 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
   const operators = roster.map(p => {
     const assigned = challenges.filter(c => c.assignees.includes(p.name));
     const engaged = assigned.filter(c => c.status === 'in-progress' || c.status === 'stuck').length;
-    const solved = assigned.filter(c => c.status === 'solved').length;
+    const solved = challenges.filter(c => c.status === 'solved' && operatorMatchesSolver(c, p)).length;
     return { name: p.name, status: p.status, assigned: assigned.length, engaged, solved };
   });
 
@@ -3097,7 +3819,8 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
   const challengeRows = sortedChallenges.map(c => {
     const cat = CATEGORIES[c.category] || CATEGORIES.misc;
     const sp = solvedPhase(c, settings);
-    const phaseTag = sp === 'locked' ? `🔒 ${lockedLabel}` : sp === 'open' ? openLabel : '';
+    const lockState = solvedLockState(c, settings);
+    const phaseTag = lockState === 'pending' ? `⏳ ${lockedLabel} lock pending` : lockState === 'locked' ? `🔒 ${lockedLabel}` : sp === 'open' ? openLabel : '';
     return `
       <tr class="status-${c.status}">
         <td><span class="cat" style="background:${cat.color}22;color:${cat.color};border-color:${cat.color}">${escapeHTML(cat.label)}</span></td>
@@ -3105,6 +3828,7 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
         <td class="title">${escapeHTML(c.title || 'Untitled')}${c.starred ? ' ★' : ''}</td>
         <td>${escapeHTML(STATUSES[c.status]?.label || c.status)} ${phaseTag}</td>
         <td>${c.points || ''}</td>
+        <td>${escapeHTML(solverDisplayName(c) || '')}</td>
         <td>${escapeHTML(c.assignees.join(', '))}</td>
         <td>${escapeHTML(c.tags.join(', '))}</td>
       </tr>`;
@@ -3151,7 +3875,7 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
     <div class="stat"><div class="stat-label">Solved</div><div class="stat-value">${stats.solved}</div></div>
     <div class="stat"><div class="stat-label">Engaged</div><div class="stat-value">${stats.engaged}</div></div>
     <div class="stat"><div class="stat-label">Stuck</div><div class="stat-value">${stats.stuck}</div></div>
-    <div class="stat"><div class="stat-label">Locked HR</div><div class="stat-value">${stats.solvedHR} · ${stats.pointsHR}pt</div></div>
+    <div class="stat"><div class="stat-label">${phase.phase === 'locked' ? 'HR Pending' : 'Locked HR'}</div><div class="stat-value">${stats.solvedHR} · ${stats.pointsHR}pt</div></div>
     <div class="stat"><div class="stat-label">Total Points</div><div class="stat-value">${stats.points}</div></div>
   </div>
 
@@ -3165,7 +3889,7 @@ function buildSnapshotHTML({ challenges, roster, settings }) {
 
   ${sortedChallenges.length ? `<h2>Challenges (${sortedChallenges.length})</h2>
   <table>
-    <thead><tr><th>Cat</th><th>Diff</th><th>Title</th><th>Status</th><th>Pts</th><th>Assignees</th><th>Tags</th></tr></thead>
+    <thead><tr><th>Cat</th><th>Diff</th><th>Title</th><th>Status</th><th>Pts</th><th>Solver</th><th>Assignees</th><th>Tags</th></tr></thead>
     <tbody>${challengeRows}</tbody>
   </table>` : '<p style="color:#999;font-style:italic">No challenges tracked yet.</p>'}
 
@@ -3216,7 +3940,7 @@ function RosterModal({ roster, settings, challenges, platformSnapshots = [], mee
   const add = () => {
     const n = newName.trim();
     if (!n || roster.some(p => p.name === n)) return;
-    onSaveRoster([...roster, { name: n, status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '' }]);
+    onSaveRoster([...roster, { name: n, status: 'active', subbedOutAt: null, strengths: [], experienceLevel: 'solid', availabilityStatus: 'available', fatigueNote: '', iccUsername: '', iccUserId: '' }]);
     setNewName('');
   };
 
@@ -3244,7 +3968,7 @@ function RosterModal({ roster, settings, challenges, platformSnapshots = [], mee
   const opStats = useMemo(() => roster.map(p => {
     const assigned = challenges.filter(c => c.assignees.includes(p.name));
     const engaged = assigned.filter(c => c.status === 'in-progress' || c.status === 'stuck').length;
-    const solved = assigned.filter(c => c.status === 'solved').length;
+    const solved = challenges.filter(c => c.status === 'solved' && operatorMatchesSolver(c, p)).length;
     return { ...p, assigned: assigned.length, engaged, solved };
   }), [roster, challenges]);
 
@@ -3483,9 +4207,12 @@ function RosterModal({ roster, settings, challenges, platformSnapshots = [], mee
                       </div>
                     </div>
                     <div style={{
-                      display: 'grid', gridTemplateColumns: '1.2fr 1fr 1fr', gap: 8,
+                      display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1.2fr', gap: 8,
                       padding: '0 12px 10px', alignItems: 'center',
                     }}>
+                      <Input value={op.iccUsername || ''}
+                        onChange={e => updateOperator(op.name, { iccUsername: e.target.value.trim() })}
+                        placeholder="icc username" style={{ fontSize: 11 }} />
                       <Select value={op.experienceLevel || 'solid'}
                         onChange={e => updateOperator(op.name, { experienceLevel: e.target.value })}
                         options={Object.entries(EXPERIENCE_LEVELS).map(([k, v]) => ({ value: k, label: v.label }))}
